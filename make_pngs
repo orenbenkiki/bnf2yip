@@ -1,0 +1,11 @@
+#!/bin/bash
+
+test -d pngs || mkdir pngs
+rm -rf pngs/*.png
+echo -n "pngs:"
+for I in $(grep 'BEGIN_MACHINE(' yaml.yip | sed 's/BEGIN_MACHINE(//;s/,.*//')
+do
+  echo -n " $I"
+  ./filter_machines $I < yaml.yip | m4 graphviz.m4 - | dot -Tpng -o pngs/$I.png
+done
+echo ""
