@@ -1,6 +1,6 @@
 -------------------------------------------------------------------------------
 -- |
--- Module      :  yaml2directives
+-- Module      :  bnf2yip
 -- Copyright   :  (c) Oren Ben-Kiki 2008
 -- License     :  LGPL
 -- 
@@ -8,13 +8,16 @@
 -- Stability   :  alpha
 -- Portability :  portable
 --
--- Convert the reference BNF file to a fat list of directives for further
--- processing, e.g. as a basis for generating a parser.
+-- Convert the reference BNF file to a list of directives for further processing, e.g. as a basis for generating a parser.
+-- Since this is a one-time operation, efficiency is most emphatically not a consideration in this code.
+
+-- TODO: 29: Unparsed
 
 module Main(main)
 where
 
-import           CharSet
+
+import qualified CharSet as CharSet
 import           Data.Char
 import           Data.List
 import qualified Data.Map as Map
@@ -26,14 +29,10 @@ import           Syntax
 import           System.Console.GetOpt
 import           System.Environment
 import           Text.Regex
+import           Utilities
 
-import           Debug.Trace
 
-
-infixl 9 |>
--- | @record |> field@ is the same as @field record@,  but is more readable.
-(|>) :: record -> (record -> value) -> value
-record |> field = field record
+-- * Command line.
 
 
 -- | Command line flag.
@@ -61,12 +60,11 @@ usage = usageInfo "yaml2yaspar: [options] [file]" optionDescriptions
 -- | @collectFlags args@ converts the command line /args/ to list of 'Flag'.
 collectFlags :: [String] -> IO [Flag]
 
-collectFlags args =
-  case getOpt Permute optionDescriptions args of
-       (_,     _,     [ errors ]) -> ioError $ userError $ errors ++ usage
-       (flags, [],    [])         -> return flags
-       (flags, [arg], [])         -> return $ Input arg : flags
-       (flags, _,     [])         -> ioError $ userError "more than one input file"
+collectFlags args = case getOpt Permute optionDescriptions args of
+                         (_,     _,     [ errors ]) -> ioError $ userError $ errors ++ usage
+                         (flags, [],    [])         -> return flags
+                         (flags, [arg], [])         -> return $ Input arg : flags
+                         (flags, _,     [])         -> ioError $ userError "more than one input file"
 
 
 -- | Options controlling program behavior
@@ -86,15 +84,13 @@ applyFlags :: [Flag] -> Options -> IO Options
 
 applyFlags [] options = return options
 
-applyFlags (flag : flags) options =
-    case flag of
-         Help        -> applyFlags flags options { oToHelp = True }
-         Output name -> applyFlags flags options { oOutput = name }
-         Input name  -> applyFlags flags options { oInput = name }
+applyFlags (flag : flags) options = case flag of
+                                         Help        -> applyFlags flags options { oToHelp = True }
+                                         Output name -> applyFlags flags options { oOutput = name }
+                                         Input name  -> applyFlags flags options { oInput = name }
 
 
--- | @fromFile name@ returns the contents of the specified input file called
--- /name/ (may be "-" for @stdin@).
+-- | @fromFile name@ returns the contents of the specified input file called /name/ (may be "-" for @stdin@).
 fromFile :: String -> IO String
 
 fromFile name = case name of
@@ -102,8 +98,7 @@ fromFile name = case name of
                       path -> readFile path
 
 
--- | @intoFile name text@ writes the /text/ into the specified output file
--- called /name/ (may be "-" for @stdout@).
+-- | @intoFile name text@ writes the /text/ into the specified output file called /name/ (may be "-" for @stdout@).
 intoFile :: String -> String -> IO ()
 
 intoFile name text = case name of
@@ -116,13 +111,11 @@ runWith :: Options -> IO ()
 
 runWith options = do text <- fromFile (oInput options)
                      let (syntax, index) = parseSyntax $ spoilMaxUnicode text
-                     let compiled = compile syntax index
-                     intoFile (oOutput options) $ compiled
+                     intoFile (oOutput options) $ directives $ finalize index $ optimize $ prepare syntax
   where spoilMaxUnicode text = subRegex (mkRegex "10FFFF") text "1FFFF"
 
 
--- | @main@ converts an input BNF file to YIP directives. Note that since this
--- is a one-time operation, efficiency is not a consideration in this code.
+-- | @main@ converts an input BNF file to directives.
 main :: IO ()
 
 main = do args <- getArgs
@@ -132,553 +125,609 @@ main = do args <- getArgs
              then putStrLn usage
              else runWith options
 
--- | @compile syntax@ converts the parses syntax to a list of directives that
--- can be implemented in some target programming language.
-compile :: Syntax -> [ String ] -> String
 
-compile syntax index =
-  let decontexted = Map.fromList $ concatMap decontext $ Map.toList syntax
-      inlined = mapSyntax (inlineCalls decontexted Set.empty) decontexted
-      goodContext = removeBadContext inlined
-      purgedPeeks = mapSyntax purgeSubPeeks goodContext
-      simplified = mapSyntax simplify purgedPeeks
-      combinedSets = fixPoint singleStep simplified
-      sets = mapMaybe classNode $ listSyntax combinedSets
-      distinct = distinctSets $ sets ++ map fakeSet Machine.fakeClasses
-      classification = classificationDirectives distinct
-      classified = mapSyntax (classifySets distinct) combinedSets
-      selectified = mapSyntax selectify classified
-      machines = concatMap (productionMachines selectified) $ zip [1..] index
-      matching = concatMap Machine.directives machines
-  in "BEGIN_SYNTAX\n" ++
-     "BEGIN_CLASSIFICATION\n" ++
-     classification ++
-     "END_CLASSIFICATION\n" ++
-     "BEGIN_MACHINES(" ++ (show $ length index) ++ ")\n" ++
-     matching ++
-     "END_MACHINES(" ++ (show $ length index) ++ ")\n" ++
-     "END_SYNTAX\n"
-  where combineSets' syntax = mapSyntax combineSets syntax
-        flattenTrees' syntax = mapSyntax flattenTrees syntax
-        reorderLists' syntax = mapSyntax reorderLists syntax
-        singleStep syntax = reorderLists' $ combineSets' $ flattenTrees' syntax
-        classNode (Chars chars) = Just chars
-        classNode node = Nothing
-        parameterName (Variable name) = name
-        productionMachines syntax (index, name) = catMaybes [ productionMachine syntax index name ]
-                                               ++ (map subIndex $ zip [1..] $ catMaybes $ map (productionMachine syntax index) $ map (contextify name) contexts)
-        productionMachine syntax index name = case Map.lookup name syntax of
-                                                   Just (parameters, pattern) -> Just (show index, name, map parameterName parameters, patternMachineT pattern)
-                                                   Nothing -> Nothing
-        subIndex (sub, (index, name, parameters, machine)) = (index ++ "." ++ show sub, name, parameters, machine)
+-- * Prepare.
 
 
-patternMachineT pattern =
-  let machine = patternMachine {- $ trace ("pattern: " ++ show pattern) -} pattern
-  in trace ("Pattern: " ++ show pattern ++ "\nMachine: " ++ show machine ++ "\n") machine
+-- | @prepare syntax@ performs all the one-time preparations of the parsed /syntax/ before optimization.
+prepare :: Syntax -> Syntax
+
+prepare syntax = (mapSyntax $ traced "purgePeeks" purgePeeks)
+               $ (traced "filter" $ Map.filter (notElem BadContext . listNode . snd))
+               $ (\syntax -> (mapSyntax $ traced "inline" (inline syntax Set.empty)) syntax)
+               $ (traced "decontext" $ Map.fromList . concatMap decontext . Map.toList)
+               $ (mapSyntax $ traced "simplify" simplify) syntax
 
 
--- | @fixPoint function input@ repeatedly applies @function@ to the @input@
--- until the result remains the same.
-fixPoint :: Eq a => (a -> a) -> a -> a
-
-fixPoint function input =
-  if output == input
-     then input
-     else fixPoint function output
-  where output = function input
+-- ** Simplify.
 
 
--- | @decontext (name, production)@ gets rid of the @c@ parameter by splitting
--- each @production@ to separate ones.
+-- | @simplify node@ converts complex operations to atomics ones.
+simplify :: Node -> Node
+
+simplify node@(And _) = node
+
+simplify node@(AndNot _ _) = node
+
+simplify node@(Call _ _) = node
+
+simplify node@(Case _ _) = node
+
+simplify node@(Chars _) = node
+
+simplify node@(Choice _ _) = node
+
+simplify node@(Commit _) = node
+
+simplify node@NextChar = node
+
+simplify node@NextLine = node
+
+simplify (OneOrMore pattern) = And [ pattern, ZeroOrMore pattern ]
+
+simplify (Optional pattern) = Or [ pattern, Empty ]
+
+simplify node@(Or _) = node
+
+simplify node@(Plus _ _) = node
+
+simplify (RepeatN (Value times) pattern) = And $ replicate times pattern
+
+simplify node@(RepeatN _ _) = node
+
+simplify node@StartOfLine = Chars $ CharSet.fake $ CharSet.startOfLine
+
+simplify node@(Symbol _) = node
+
+simplify (Token name pattern) = And [ BeginToken name, pattern, EndToken name, PrefixError $ EndToken "Unparsed" ]
+
+simplify node@(UptoN _ _) = node
+
+simplify node@(Value _) = node
+
+simplify node@(Variable _) = node
+
+simplify (WrapTokens beginToken endToken pattern) = And [ EmptyToken beginToken, pattern, EmptyToken endToken, PrefixError $ EmptyToken endToken ]
+
+simplify node = error $ "simplify: " ++ show node
+
+
+-- ** Decontext.
+
+
+-- | @decontext (name, production)@ gets rid of the /c/ parameter by splitting each /production/ to separate ones.
+-- The name of each one is the original /name/ combined with the specific context.
 decontext :: (String, Production) -> [ (String, Production) ]
 
 decontext (name, production@(parameters, pattern))
-  | elem (Variable "c") parameters = map productize $ decontextAlternatives pattern
+  | elem (Variable "c") parameters = map productize $ catMaybes $ decontextAlternatives pattern
   | otherwise = [ (name, production) ]
-      where productize (context, pattern) = (contextify name context, (parameters', pattern))
+      where productize (context, node) = (contextify name context, (parameters', node))
             parameters' = filter (/= Variable "c") parameters
 
--- | @contextify name context@ converts a @Production@ @name@ to a name that
--- also contains the @context@.
-contextify :: String -> String -> String
-
-contextify name "BlockOut" = name ++ " block-out"
-contextify name "BlockIn"  = name ++ " block-in"
-contextify name "BlockKey" = name ++ " block-key"
-contextify name "FlowOut"  = name ++ " flow-out"
-contextify name "FlowIn"   = name ++ " flow-in"
-contextify name "FlowKey"  = name ++ " flow-key"
 
 -- | The list of all the possible contexts.
-contexts = [ "BlockOut", "BlockIn", "BlockKey", "FlowOut", "FlowIn", "FlowKey" ]
+contexts = [ "block-out", "block-in", "block-key", "flow-out", "flow-in", "flow-key" ]
 
--- | @decontextAlternatives node@ converts a @node@ to a list of alternatives,
--- one for each possible context.
-decontextAlternatives :: Node -> [ (String, Node) ]
+
+-- | @decontextAlternatives node@ converts a /node/ to a list of alternatives, one for each possible context.
+decontextAlternatives :: Node -> [ Maybe (String, Node) ]
 
 decontextAlternatives (Case (Variable "c") alternatives)  = map contextAlternative contexts
   where contextAlternative context = case find (isContextAlternative context) alternatives of
-                                          Just (_, pattern) -> (context, pattern)
-                                          Nothing           -> (context, BadContext)
+                                          Just (_, node) -> Just (context, node)
+                                          Nothing        -> Nothing
         isContextAlternative context (Symbol value, _) = context == value
 
 decontextAlternatives node = map decontextNode contexts
-  where decontextNode context = (context, mapNode (applyContext context) node)
+  where decontextNode context = Just (context, mapNode (applyContext context) node)
         applyContext context node@(Call name parameters)
           | elem (Variable "c") parameters = Call (contextify name context) (filter (/= Variable "c") parameters)
           | otherwise = node
         applyContext context node = node
 
 
--- | @inlineCalls syntax callers node@ converts each call @node@s to the
--- invoked procedure body, except for recursive calls.
-inlineCalls :: Syntax -> Set.Set String -> Node -> Node
+-- | @contextify name context@ converts a @Production@ @name@ to a name that also contains the @context@.
+contextify :: String -> String -> String
 
-inlineCalls syntax callers node@(Call name parameters)
-  | foldr (&&) True $ map passthrough parameters =
-      if Set.member name callers
-         then node
-         else let callers' = Set.insert name callers
-                  (_, pattern) = fromJust $ Map.lookup name syntax
-                  pattern' = mapNode (inlineCalls syntax callers') pattern
-              in case find recursiveCall $ listNode pattern' of
-                      Nothing -> pattern'
-                      Just _  -> Be name pattern'
-              where recursiveCall (Call name' _) = name' == name
-                    recursiveCall _ = False
-                    passthrough (Variable _) = True
-                    passthrough _ = False
+contextify name context = name ++ " " ++ context
 
-inlineCalls syntax callers node = node
+-- ** Inline.
 
 
--- | @removeBadContext syntax@ removes all the @syntax@ @Production@s that have
--- a nonsencical context.
-removeBadContext :: Syntax -> Syntax
+-- | @inline syntax callers node@ converts each call @node@s to the invoked procedure body, except for recursive calls.
+inline :: Syntax -> Set.Set String -> Node -> Node
 
-removeBadContext syntax = Map.filter (notElem BadContext . listNode . snd) syntax
+inline syntax callers node@(Call name parameters)
+  | foldr (||) False $ map isComplex parameters = error $ "inline: " ++ show node
+  | Set.member name callers = node
+  | Map.lookup name syntax == Nothing = BadContext
+  | otherwise = let callers' = Set.insert name callers
+                    Just (_, pattern) = Map.lookup name syntax
+                    pattern' = mapNode (inline syntax callers') pattern
+                in case find isRecursiveCall $ listNode pattern' of
+                        Just _  -> Be name pattern'
+                        Nothing -> pattern'
+  where isComplex (Variable _) = False
+        isComplex _ = True
+        isRecursiveCall (Call name' _) = name' == name
+        isRecursiveCall _ = False
 
-
--- | @purgeSubPeeks node@ purges any actions from any lookahead
--- sub-nodes of the @node@.
-purgeSubPeeks :: Node -> Node
-
-purgeSubPeeks (AndNot base subtract) = AndNot base $ mapNode purgePeek subtract
-
-purgeSubPeeks (Forbidding forbidden pattern) = Forbidding (mapNode purgePeek forbidden) pattern
-
-purgeSubPeeks (Peek pattern) = Peek $ mapNode purgePeek pattern
-
-purgeSubPeeks (Prev pattern) = Prev $ mapNode purgePeek pattern
-
-purgeSubPeeks (Reject pattern) = Reject $ mapNode purgePeek pattern
-
-purgeSubPeeks node = node
+inline syntax callers node = node
 
 
--- | @purgePeek node@ purges any actions from the lookahead @node@.
-purgePeek :: Node -> Node
-
-purgePeek (EmptyToken _) = Empty
-
-purgePeek (Token _ node) = node
-
-purgePeek node@(Call _ _) = error $ "PP: " ++ show node
-
-purgePeek node = node
+-- ** Purge peeks.
 
 
--- | @simplify node@ converts complex operations to atomics ones.
-simplify :: Node -> Node
+-- | @purgePeeks node@ purges any side-effect actions from inside a peek /node/.
+purgePeeks :: Node -> Node
 
-simplify (Token name pattern) = And [ BeginToken name, pattern, EndToken name ]
+purgePeeks (AndNot base subtract) = AndNot base $ purgePeekActions subtract
 
-simplify (RepeatN (Value times) pattern) = And $ replicate times pattern
+purgePeeks node@(And _) = node
 
-simplify chars@(Chars _) = And [ chars, NextChar ]
+purgePeeks node@(BeginToken _) = node
 
-simplify (Optional pattern) = Or [ pattern, Empty ]
+purgePeeks node@(Chars _) = node
 
-simplify (OneOrMore pattern) = And [ pattern, ZeroOrMore pattern ]
+purgePeeks node@(Choice _ _) = node
 
-simplify StartOfLine = Chars $ fakeSet Machine.startOfLine
+purgePeeks node@(Commit _) = node
 
-simplify (Case _ _) = error "Never happens"
+purgePeeks node@Empty = node
 
-simplify pattern = pattern
+purgePeeks node@(EmptyToken _) = node
 
+purgePeeks node@(EndToken _) = node
 
-flattenTreesT node =
-  let node' = flattenTrees node
-  in trace ("BEFORE: " ++ show node ++ "\nAFTER: " ++ show node' ++ "\n") node'
+purgePeeks node@NextChar = node
 
--- | @flattenTrees node@ converts deep binary trees of @And@ and @Or@
--- operations to flat lists. It also pushes @AndNot@ operations as far down the
--- tree as possible so later we'll be able to replace them all by simple
--- @CharSet@s.
-flattenTrees :: Node -> Node
+purgePeeks node@NextLine = node
 
-flattenTrees (AndNot base (And [ chars@(Chars _), NextChar ])) =
-  AndNot base chars
+purgePeeks node@(Or _) = node
 
-flattenTrees (AndNot (And (empty@(EmptyToken _) : head : tail)) subtract) =
-  And $ empty : AndNot head subtract : tail
+purgePeeks node@(Plus _ _) = node
 
-flattenTrees (AndNot (And (prev@(Prev _) : head : tail)) subtract) =
-  And $ prev : AndNot head subtract : tail
+purgePeeks node@(PrefixError _) = node
 
-flattenTrees (AndNot (And (head : tail)) subtract) =
-  And $ (AndNot head subtract) : tail
+purgePeeks node@(RepeatN _ _) = node
 
-flattenTrees (AndNot (Choice name pattern) subtract) =
-  Choice name $ AndNot pattern subtract
+purgePeeks node@(UptoN _ _) = node
 
-flattenTrees (AndNot (Or nodes) subtract) =
-  Or $ map andNot nodes
-  where andNot node = AndNot node subtract
+purgePeeks node@(Value _) = node
 
-flattenTrees (AndNot (Token name pattern) subtract) =
-  Token name $ AndNot pattern subtract
+purgePeeks node@(Variable _) = node
 
-flattenTrees andNot@(AndNot _ _) = error ("AN: " ++ show andNot) andNot
+purgePeeks node@(ZeroOrMore _) = node
 
-flattenTrees (And nodes) =
-  case nodes' of
-       [ single ] -> single
-       _          -> And nodes'
-  where nodes' = flattenList nodes
-        flattenList [] = []
-        flattenList (And nodes : tail) = flattenList $ nodes ++ tail
-        flattenList (Chars _ : Chars _ : _) = error "Never happens"
-        flattenList (BadContext : _) = error "Never happens"
-        flattenList (head : tail) = head : flattenList tail
-
-flattenTrees (Or nodes) =
-  case nodes' of
-       [ single ] -> single
-       _          -> Or nodes'
-  where nodes' = deepenList $ flattenList nodes
-        flattenList [] = []
-        flattenList (Or nodes : rest) =
-          flattenList $ nodes ++ rest
-        flattenList (BadContext : _) = error "Never happens"
-        flattenList (first : rest) = first : flattenList rest
-        deepenList [] = []
-        deepenList (RepeatN (Variable "n") repeatPattern : UptoN (Variable "n") uptoPattern : rest)
-          | repeatPattern == uptoPattern =
-              deepenList $ UptoN (Plus (Variable "n") (Value 1)) repeatPattern : rest
-        deepenList (UptoN (Variable "n") uptoPattern : RepeatN (Variable "n") repeatPattern : rest)
-          | repeatPattern == uptoPattern =
-              deepenList $ UptoN (Plus (Variable "n") (Value 1)) repeatPattern : rest
-        deepenList (And (RepeatN (Variable "n") repeatPattern : repeatTail)
-                  : And (UptoN   (Variable "n") uptoPattern   : uptoTail)
-                  : rest)
-          | repeatPattern == uptoPattern = deepenList $ LoopN (Variable "n") (flattenTrees repeatPattern) (flattenTrees $ And uptoTail) (flattenTrees $ And repeatTail) : rest
-        deepenList (And (firstHead : firstTail) : second : rest)
-          | firstHead == second =
-              let first = flattenTrees $ And firstTail
-                  deep = flattenTrees $ And [ firstHead, Or [ first, Empty ] ]
-              in deepenList $ deep : rest
-        deepenList (first : And (secondHead : secondTail) : rest)
-          | first == secondHead = error "Must never happen in a valid syntax"
-        deepenList (And (firstHead : firstTail) : And (secondHead : secondTail) : rest)
-          | firstHead == secondHead =
-              let first = flattenTrees $ And firstTail
-                  second = flattenTrees $ And secondTail
-                  deep = flattenTrees $ And [ firstHead, Or [ first, second ] ]
-              in deepenList $ deep : rest
-        deepenList (first@(And (Chars firstChars : firstTail))
-                  : second@(And (Chars secondChars : secondTail))
-                  : rest)
-          | firstTail == secondTail =
-             let chars = Chars $ addSets firstChars secondChars
-                 head = flattenTrees $ And $ chars : firstTail
-             in deepenList $ head : rest
-          | otherwise =
-             let firstOnly = subtractSets firstChars secondChars
-                 secondOnly = subtractSets secondChars firstChars
-                 bothChars = subtractSets firstChars firstOnly
-                 bothTail = [ Or [ flattenTrees $ And firstTail, flattenTrees $ And secondTail ] ]
-                 (head : tail) = catMaybes [ maybeChars firstOnly firstTail, maybeChars secondOnly secondTail, maybeChars bothChars bothTail ] ++ rest
-             in head : deepenList tail
-             where maybeChars chars tail
-                     | chars == emptySet = Nothing
-                     | otherwise = Just $ flattenTrees $ And $ (Chars chars) : tail
-        deepenList [ Chars _, Empty ] = [ Empty ]
-        deepenList (first : rest) = first : deepenList rest
-
-flattenTrees node@(Call _ _) = error $ "FT: " ++ show node
-
-flattenTrees node = node
+purgePeeks node = error $ "purgePeeks: " ++ show node
 
 
--- | @reorderLists node@ reorders sequences of sub-nodes to optimize the
--- resulting syntax.
-reorderLists :: Node -> Node
+-- | @purgePeekActions node@ purges any side-effect actions from the peek /node/.
+purgePeekActions :: Node -> Node
 
-reorderLists (And nodes) = And $ reorderNodes nodes
+purgePeekActions node@(And _) = node
 
-reorderLists node = node
+purgePeekActions node@NextChar = node
 
-reorderNodes [] = []
+purgePeekActions node@(Or _) = node
 
-reorderNodes [node] = [node]
+purgePeekActions node = error $ "purgePeekActions: " ++ show node
 
-reorderNodes (first : tail) =
-  let (second : tail') = reorderNodes tail
-  in if shouldFlip first second
-        then reorderNodes (second : first : tail')
-        else (first : second : tail')
 
--- | @shouldFlip left right@ returns whether or flipping the order of the nodes
--- would result in an equivalent, more optimized syntax.
+-- * Optimize.
+
+
+-- | @optimize syntax@ repeatedly performs optimizations on the /syntax/ until it reaches a (hopefully) optimal form.
+optimize :: Syntax -> Syntax
+
+optimize syntax = fixpoint (mapSyntax (traced "collapseLists" collapseLists)
+                          . mapSyntax (traced "computeAndNots" computeAndNots)
+                          . mapSyntax (traced "distinctOrChars" distinctOrChars)
+                          . mapSyntax (traced "flattenAnds" flattenAnds)
+                          . mapSyntax (traced "flattenOrs" flattenOrs)
+                          . mapSyntax (traced "mergeOrChars" mergeOrChars)
+                          . mapSyntax (traced "mergeOrHeads" mergeOrHeads)
+                          . mapSyntax (traced "mergeOrLoops" mergeOrLoops)
+                          . mapSyntax (traced "removeAndEmpties" removeAndEmpties)
+                          . mapSyntax (traced "removeSimpleChoices" removeSimpleChoices)
+                          . mapSyntax (traced "reorderAndLists" reorderAndLists)
+                          . mapSyntax (traced "simplifyAndNots" simplifyAndNots)) syntax
+
+
+-- | @collapseLists node@ collapses sub-node lists of an @Or@ or an @And@ /node/.
+collapseLists :: Node -> Node
+
+collapseLists (And [ node ]) = node
+
+collapseLists (Or [ node ]) = node
+
+collapseLists node = node
+
+
+-- | @distinctOrChars node@ splits consequtive @Chars@ in an @Or@ node to distinct sets.
+distinctOrChars :: Node -> Node
+
+distinctOrChars (Or nodes) = Or $ foldr merge [] nodes
+  where merge first@(And (Chars firstChars : firstTail)) (second@(And (Chars secondChars : secondTail)) : rest) =
+          let firstOnlyChars = CharSet.subtract firstChars secondChars
+              firstOnly = And $ Chars firstOnlyChars : firstTail
+              secondOnlyChars = CharSet.subtract secondChars firstChars
+              secondOnly = And $ Chars secondOnlyChars : secondTail
+              bothChars = CharSet.subtract firstChars firstOnlyChars
+              both = And [ Chars bothChars, Or [ And firstTail, And secondTail ] ]
+          in catMaybes [ maybe firstOnlyChars firstOnly, maybe secondOnlyChars secondOnly, maybe bothChars both ] ++ rest
+        merge first@(And (Chars firstChars : firstTail)) (second@(Chars secondChars) : rest) =
+          let firstOnlyChars = CharSet.subtract firstChars secondChars
+              firstOnly = And $ Chars firstOnlyChars : firstTail
+              secondOnlyChars = CharSet.subtract secondChars firstChars
+              secondOnly = Chars secondOnlyChars
+              bothChars = CharSet.subtract firstChars firstOnlyChars
+              both = And [ Chars bothChars, Or [ And firstTail, Empty ] ]
+          in catMaybes [ maybe firstOnlyChars firstOnly, maybe secondOnlyChars secondOnly, maybe bothChars both ] ++ rest
+        merge node nodes = node : nodes
+        maybe chars node
+          | chars == CharSet.empty = Nothing
+          | otherwise              = Just node
+
+distinctOrChars node = node
+
+
+-- | @computeAndNots node@ computes character sets in and @AndNot@ /node/.
+computeAndNots :: Node -> Node
+
+computeAndNots (AndNot (And (Chars baseChars : baseTail)) (And (Chars subtract : _))) = And $ (Chars $ CharSet.subtract baseChars subtract) : baseTail
+
+computeAndNots node = node
+
+
+-- | @flattenAnds node@ flattens and @And@ of @And@ /node/ to a single @Node@.
+flattenAnds :: Node -> Node
+
+flattenAnds (And nodes) = And $ foldr merge [] nodes
+  where merge (And nested) nodes = nested ++ nodes
+        merge node nodes = node : nodes
+
+flattenAnds node = node
+
+
+-- | @flattenOrs node@ flattens and @Or@ of @Or@ /node/ to a single @Node@.
+flattenOrs :: Node -> Node
+
+flattenOrs (Or nodes) = Or $ foldr merge [] nodes
+  where merge (Or nested) nodes = nested ++ nodes
+        merge node nodes = node : nodes
+
+flattenOrs node = node
+
+
+-- | @mergeOrChars node@ merges consequtive @Chars@ sub-nodes of an @Or@ /node/.
+mergeOrChars :: Node -> Node
+
+mergeOrChars (Or nodes) = Or $ foldr merge [] nodes
+  where merge node [] = [ node ]
+        -- Q merge (Chars first) (Chars second : nodes) = (Chars $ CharSet.union first second) : nodes
+        merge (And (Chars firstChars : firstTail)) (And (Chars secondChars : secondTail) : rest)
+          | firstTail == secondTail = And (Chars (CharSet.union firstChars secondChars) : firstTail) : rest
+        merge node nodes = node : nodes
+
+mergeOrChars node = node
+
+
+-- | @mergeOrHeads node@ merges common head elements of an @Or@ /node/ sub-nodes lists.
+mergeOrHeads :: Node -> Node
+
+mergeOrHeads (Or nodes) = Or $ foldr merge [] nodes
+  where merge node [] = [ node ]
+        merge (And (firstHead : firstTail)) (And (secondHead : secondTail) : rest)
+          | firstHead == secondHead = And [ firstHead, Or [ And firstTail, And secondTail ] ] : rest
+        merge (And (firstHead : firstTail)) (second : rest)
+          | firstHead == second = And [ firstHead, Or [ And firstTail, Empty ] ] : rest
+        merge node nodes = node : nodes
+
+mergeOrHeads node = node
+
+
+-- | @mergeOrLoops node@ merges loop head elements of an @Or@ /node/ sub-nodes lists.
+mergeOrLoops :: Node -> Node
+
+mergeOrLoops (Or nodes) = Or $ foldr merge [] nodes
+  where merge node [] = [ node ]
+        merge (And (RepeatN repeatTimes repeatPattern : repeatTail)) (And (UptoN uptoTimes uptoPattern : uptoTail) : rest)
+          | uptoTimes == repeatTimes && uptoPattern == repeatPattern = (LoopN repeatTimes repeatPattern (And uptoTail) (And repeatTail)) : rest
+        merge node nodes = node : nodes
+
+mergeOrLoops node = node
+
+
+-- | @removeAndEmpties node@ removes @Empty@ nodes from and @And@ /node/ sub-nodes list.
+removeAndEmpties :: Node -> Node
+
+removeAndEmpties (And nodes) = And $ filter (/= Empty) nodes
+
+removeAndEmpties node = node
+
+
+-- | @removeSimpleChoices node@ converts simple @Choice@ /node/s to @Or@ nodes.
+removeSimpleChoices :: Node -> Node
+
+removeSimpleChoices (Choice name pattern)
+  | Nothing == find isComplexChoice (listNode pattern) = mapNode clearChoices pattern
+  where clearChoices (Choice choice pattern) | choice == name = pattern
+        clearChoices (Commit choice) | choice == name = Empty
+        clearChoices node = node
+        isComplexChoice (Or nodes) = foldr isComplexAlternative False nodes
+        isComplexChoice node = False
+        isComplexAlternative (And (Chars _ : _)) result = result
+        isComplexAlternative (Chars _) result = result
+        isComplexAlternative Empty result = result
+        isComplexAlternative _ _ = True
+
+removeSimpleChoices node = node
+
+
+-- | @reorderAndLists node@ reorders @And@ /node/ sub-nodes lists.
+reorderAndLists :: Node -> Node
+
+reorderAndLists (And nodes) = And $ foldr merge [] nodes
+  where merge node [] = [ node ]
+        merge first (second : rest) = if shouldFlip first second
+                                         then second : first : rest
+                                         else first : second : rest
+
+reorderAndLists node = node
+
+
+-- | @simplifyAndNots node@ simplifies complex @AndNode@ /node/s.
+simplifyAndNots :: Node -> Node
+
+simplifyAndNots (AndNot (Choice name pattern) subtract) = Choice name $ AndNot pattern subtract
+
+simplifyAndNots (AndNot (Or alternatives) subtract) = Or $ map andNot alternatives
+  where andNot pattern = AndNot pattern subtract
+
+simplifyAndNots node = node
+
+
+-- | @shouldFlip first second@ returns whether flipping the order of the /first/ and /second/ nodes would improve the syntax.
 shouldFlip :: Node -> Node -> Bool
-
-shouldFlip (Choice _ (Or nodes)) node = foldr (&&) True $ map ((flip shouldFlip) node) nodes
-
-shouldFlip node (Choice _ (Or nodes)) = foldr (&&) True $ map (shouldFlip node) nodes
-
-shouldFlip (Or nodes) node = foldr (&&) True $ map ((flip shouldFlip) node) nodes
-
-shouldFlip node (Or nodes) = foldr (&&) True $ map (shouldFlip node) nodes
 
 shouldFlip (And nodes) node = foldr (&&) True $ map ((flip shouldFlip) node) nodes
 
 shouldFlip node (And nodes) = foldr (&&) True $ map (shouldFlip node) nodes
 
-shouldFlip (RepeatN times pattern) node = shouldFlip pattern node
+shouldFlip (Choice _ pattern) node = shouldFlip pattern node
 
-shouldFlip node (RepeatN times pattern) = shouldFlip node pattern
+shouldFlip node (Choice _ pattern) = shouldFlip node pattern
 
-shouldFlip (UptoN times pattern) node = shouldFlip pattern node
+shouldFlip (LoopN times pattern less equal) node = shouldFlip pattern node && shouldFlip less node && shouldFlip equal node
 
-shouldFlip node (UptoN times pattern) = shouldFlip node pattern
+shouldFlip node (LoopN times pattern less equal) = shouldFlip node pattern && shouldFlip node less && shouldFlip node equal
 
-shouldFlip (LoopN times pattern less equal) node = shouldFlip (And [ pattern, less, equal ]) node
+shouldFlip (Or nodes) node = foldr (&&) True $ map ((flip shouldFlip) node) nodes
 
-shouldFlip node (LoopN times pattern less equal) = shouldFlip node (And [ pattern, less, equal ])
+shouldFlip node (Or nodes) = foldr (&&) True $ map (shouldFlip node) nodes
+
+shouldFlip (PrefixError pattern) node = shouldFlip pattern node
+
+shouldFlip node (PrefixError pattern) = shouldFlip node pattern
+
+shouldFlip (RepeatN _ pattern) node = shouldFlip pattern node
+
+shouldFlip node (RepeatN _ pattern) = shouldFlip node pattern
+
+shouldFlip (UptoN _ pattern) node = shouldFlip pattern node
+
+shouldFlip node (UptoN _ pattern) = shouldFlip node pattern
 
 shouldFlip (ZeroOrMore pattern) node = shouldFlip pattern node
 
 shouldFlip node (ZeroOrMore pattern) = shouldFlip node pattern
 
-shouldFlip left right =
-  if keepOrder left right || keepOrder right left
+shouldFlip first second =
+  if keepOrder first second || keepOrder second first
      then False
-     else case switchOrder left right of
+     else case switchOrder first second of
                Just result -> result
-               Nothing     -> case switchOrder right left of
+               Nothing     -> case switchOrder second first of
                                    Just result -> not result
-                                   Nothing     -> error $ "SF: " ++ show left ++ " <=> " ++ show right
+                                   Nothing     -> error $ "shouldFlip: " ++ show first ++ " <=> " ++ show second
 
--- | @keepOrder left right@ returns whether the @left@ and @right@ nodes must
--- never be flipped.
+
+-- | @keepOrder first second@ returns whether the /first/ and /second/ nodes should not be flipped, regardless of the order they are in.
 keepOrder :: Node -> Node -> Bool
 
-keepOrder (AndNot _ _) _ = True
+keepOrder (BeginToken _) (BeginToken _) = True
+
+keepOrder (BeginToken _) (EndToken _) = True
 
 keepOrder (BeginToken _) (EmptyToken _) = True
-keepOrder (BeginToken _) (EndToken _) = True
-keepOrder (BeginToken _) NextChar = True
-keepOrder (Chars _) (Commit _) = True
-keepOrder (Chars _) NextChar = True
+
 keepOrder (Chars _) (Chars _) = True
-keepOrder (EndToken _) (EmptyToken _) = True
-keepOrder (EndToken _) NextChar = True
+
+keepOrder (Chars _) (Commit _) = True
+
+keepOrder (EmptyToken _) (EmptyToken _) = True
+
+keepOrder (EmptyToken _) (EndToken _) = True
+
+keepOrder (EndToken _) (EndToken _) = True
+
+keepOrder NextChar (BeginToken _) = True
+
+keepOrder NextChar (Chars _) = True
+
+keepOrder NextChar (EndToken _) = True
+
+keepOrder NextChar NextLine = True
 
 keepOrder _ _ = False
 
 
--- | @switchOrder left right@ returns whether the @left@ and @right@ nodes
--- should be flipped. If it returns @Nothing@, try reversing the order.
+-- | @switchOrder first second@ returns whether the @first@ and @second@ nodes should be flipped.
+-- If it returns @Nothing@, try reversing the order (and the result).
 switchOrder :: Node -> Node -> Maybe Bool
 
 switchOrder (Chars _) (BeginToken _) = Just False
+
 switchOrder (Chars _) (EmptyToken _) = Just False
+
 switchOrder (Chars _) (EndToken _) = Just False
+
 switchOrder (Chars _) NextLine = Just False
+
 switchOrder (Commit _) (BeginToken _) = Just False
+
 switchOrder (Commit _) (EmptyToken _) = Just False
+
 switchOrder (Commit _) (EndToken _) = Just False
+
 switchOrder (Commit _) NextChar = Just False
-switchOrder (EndToken _) NextLine = Just False
+
+switchOrder NextLine (EndToken _) = Just False
+
 switchOrder NextLine (BeginToken _) = Just False
 
 switchOrder _ _ = Nothing
 
 
--- | @combineSets syntax node@ replaces nodes by the equivalent @CharSet@
--- where possible.
-combineSets :: Node -> Node
-
-combineSets (AndNot (Chars base) (Chars subtract)) =
-  Chars $ subtractSets base subtract
-
-combineSets (Or nodes) =
-  case nodes' of
-       [ single ] -> single
-       _          -> Or nodes'
-  where nodes' = combineList nodes
-        combineList [] = []
-        combineList (head@(Chars first) : tail) =
-          case tail' of
-               ((Chars second) : tail'') -> (Chars $ addSets first second) : tail''
-               _                       -> head : tail'
-          where tail' = combineList tail
-        combineList (head : tail) = head : combineList tail
-
-combineSets node@(Call _ _) = error $ "CS: " ++ show node
-
-combineSets node = node
+-- * Finalize.
 
 
--- | @selectify syntax node@ replaces (parts of) @Or@ nodes by an equivalent
--- @Select@ node where possible.
-selectify :: Node -> Node
+-- | @finalize index syntax@ performs final one-time processing on the /syntax/ using its /index/ before converting it to directives.
+finalize :: [ String ] -> Syntax -> ([ CharSet.CharSet ], [ Machine.Named ])
 
-selectify (Or nodes) =
-  case nodes' of
-       [ single ] -> single
-       _          -> Or nodes'
-  where nodes' = combineList $ map charify nodes
-        combineList [] = []
-        combineList (And (Classes classes1 : tail1) : And (Classes classes2 : tail2) : rest) = combineList $ (Select [(Just classes1, tailAnd tail1), (Just classes2, tailAnd tail2)]) : rest
-        combineList (And (Classes classes1 : tail1) : Classes classes2 : rest) = combineList $ (Select [(Just classes1, tailAnd tail1), (Just classes2, Empty)]) : rest
-        combineList [ And (Classes classes : tail), Empty ] = [ Select [ (Just classes, tailAnd tail), (Nothing, Empty) ] ]
-        combineList (Select alternatives : And (Classes classes2 : tail2) : rest) = combineList $ (Select $ alternatives ++ [ (Just classes2, tailAnd tail2) ]) : rest
-        combineList (Select alternatives : Classes classes2 : rest) = combineList $ (Select $ alternatives ++ [ (Just classes2, Empty) ]) : rest
-        combineList [ Select alternatives, pattern ] = [ Select $ alternatives ++ [ (Nothing, pattern) ] ]
-        combineList (Classes classes1 : And (Classes classes2 : tail2) : rest) = combineList $ (Select [(Just classes1, Empty), (Just classes2, tailAnd tail2)]) : rest
-        combineList (Classes classes : Select alternatives : rest) = combineList $ (Select $ (Just classes, Empty) : alternatives ) : rest
-        combineList (Classes classes1 : Classes classes2 : rest) = combineList $ (Select $ [ (Just classes1, Empty), (Just classes2, Empty) ]) : rest
-        combineList (head : tail) = head : combineList tail
-        tailAnd [ pattern ] = pattern
-        tailAnd patterns = And patterns
-
-selectify node@(Choice name pattern)
-  | (find isOr $ listNode pattern) == Nothing = mapNode emptyCommit pattern
-      where isOr (Or _) = True
-            isOr _ = False
-            emptyCommit (Commit choice) | choice == name = Empty
-            emptyCommit node = node
-
-selectify node = node
+finalize index syntax = let distinct = distinctSets syntax
+                        in (distinct, machinize index $ selectify $ classify distinct syntax)
 
 
--- | @charify node@ converts @node@ to the form @And [ Classes _ , ... ]@, if
--- possible, so that @selectify@ can merge it into a @Select@.
-charify :: Node -> Node
-
-charify node =
-  case classify node of
-       Nothing -> node
-       Just classes -> And [ Classes classes, node ]
-  where classify (And (Classes _ : _)) = Nothing
-        classify (And nodes) = foldr locateClasses Nothing nodes
-        classify node = Nothing
-        locateClasses (Classes classes) _ = Just classes
-        locateClasses NextLine classes = classes
-        locateClasses (BeginToken _) classes = classes
-        locateClasses (Select alternatives) _ = foldl unionClasses (Just Set.empty) $ map fst alternatives
-          where unionClasses (Just classes1) (Just classes2) = Just $ Set.union classes1 classes2
-                unionClasses _ _ = Nothing
-        locateClasses (UptoN _ pattern) _ = Nothing
-        locateClasses (RepeatN _ pattern) _ = Nothing
-        -- locateClasses nodes _ = Nothing
-        locateClasses nodes _ = error $ "LC: " ++ show nodes
-
--- | @classificationDirectives@ computes a list of directives for classifyin
--- characters.
-classificationDirectives :: [ CharSet ] -> String
-
-classificationDirectives distinct =
-  "BEGIN_CLASSIFICATION_TABLE(" ++ (show $ 1 + maxLowCode) ++ ")\n" ++
-  classificationTable distinct ++
-  "END_CLASSIFICATION_TABLE(" ++ (show $ 1 + maxLowCode) ++ ")\n" ++
-  "BEGIN_CLASSIFICATION_RANGES\n" ++
-  classificationRanges distinct ++
-  "END_CLASSIFICATION_RANGES\n"
+-- ** Classify.
 
 
--- | @classificationTable distinct@ computes a table assigning a class index
--- to each low character code.
-classificationTable :: [ CharSet ] -> String
+-- | @distinctSets syntax@ computes the distinct sets of characters that are equivalent as far as the /syntax/ is concerned.
+distinctSets :: Syntax -> [ CharSet.CharSet ]
 
-classificationTable distinct =
-  concatMap codeClass [0 .. maxLowCode]
-  where codeClass code = "LOW_CHAR_CLASS(" ++ show code
-                      ++ ", " ++ show (classIndex code)
-                      ++ ")\n"
-        classIndex code = (fromMaybe 0 $ findIndex (containsCode code) distinct) - length Machine.fakeClasses
+distinctSets syntax = CharSet.distinct $ map CharSet.fake CharSet.fakeCodes ++ (mapMaybe nodeChars $ listSyntax syntax)
+                      where nodeChars (Chars chars) = Just chars
+                            nodeChars _ = Nothing
 
 
--- | @classificationTable distinct@ computes a set of tests for classifying
--- high character codes.
-classificationRanges :: [ CharSet ] -> String
+-- | @classify distinct syntax@ converts all @Chars@ in the /syntax/ to @Classes@ according to the /distinct/ sets.
+classify :: [ CharSet.CharSet ] -> Syntax -> Syntax
 
-classificationRanges distinct = concatMap rangesTests $ zip [- length Machine.fakeClasses ..] distinct
-  where rangesTests (index, (_, ranges)) = concatMap (rangeTest index) ranges
-        rangeTest index (low, high) = "HIGH_CHAR_RANGE(" ++ (show $ index)
-                                   ++ ", " ++ (show low)
-                                   ++ ", " ++ (show $ fixMaxUnicode high)
-                                   ++ ")\n"
-        fixMaxUnicode 0x1FFFF = 0x10FFFF
-        fixMaxUnicode code = code
+classify distinct syntax = mapSyntax (classifyNode distinct) syntax
 
 
--- | @classifySets distinct node@ converts @Chars@ nodes to @Classes@ nodes
--- based on a set of @distinct@ @CharSet@s.
-classifySets :: [ CharSet ] -> Node -> Node
+-- | @classifyNode distinct node@ converts each @Chars@ /node/ to @Classes@ based on a set of /distinct/ @CharSet@s.
+classifyNode :: [ CharSet.CharSet ] -> Node -> Node
 
-classifySets distinct (Chars chars) = Classes (Set.fromList classes)
-  where classes = mapMaybe containsChars $ zip [0..] distinct
-        containsChars (index, distinct_set) =
-          if containsSet chars distinct_set
-             then Just index
-             else Nothing
+classifyNode distinct (Chars chars) = Classes $ Set.fromList $ mapMaybe usedClassIndex $ zip [0..] distinct
+  where usedClassIndex (index, set) = if CharSet.contains chars set
+                                         then Just index
+                                         else Nothing
 
-classifySets distinct node = node
+classifyNode distinct node = node
 
 
--- | @patternMachine node@ Converts the @node@ to a @Machine@.
-patternMachine :: Node -> Machine.Machine
+-- ** Selectify
 
-patternMachine (And nodes) = Machine.sequential $ map patternMachineT nodes
 
-patternMachine (Or nodes) = Machine.alternatives $ map patternMachineT nodes
+-- | @selectify syntax@ converts suitable @Or@s in the /syntax/ to @Select@s.
+selectify :: Syntax -> Syntax
 
-patternMachine (Select alternatives) = Machine.select $ map patternAlternative alternatives
-  where patternAlternative (selector, pattern) = (selector, patternMachineT pattern)
+selectify syntax = mapSyntax (traced "selectifyNode" selectifyNode) syntax
 
-patternMachine (Classes classes) = Machine.matchClasses classes
 
-patternMachine NextChar = Machine.nextChar
+-- | @selectifyNode node@ converts as much as possible of an @Or@ /node/ to a @Select@.
+selectifyNode :: Node -> Node
 
-patternMachine NextLine = Machine.nextLine
+selectifyNode (Or nodes) = collapseLists $ Or $ foldr merge [] nodes
+  where merge (Classes classes) [] = [ Select [ (Just classes, Empty) ] ]
+        merge Empty [] = [ Select [ (Nothing, Empty) ] ]
+        merge node [] = [ node ]
+        merge (Classes classes) nodes = nodes
+        merge (And (Classes firstClasses : firstTail)) (And (Classes secondClasses : secondTail) : rest) =
+          Select [ (Just firstClasses, collapseLists $ And firstTail), (Just secondClasses, collapseLists $ And secondTail) ] : rest
+        merge (And (Classes classes : tail)) (Select alternatives : rest) = (Select $ (Just classes, collapseLists $ And tail) : alternatives) : rest
+        merge (And (Classes classes : tail)) nodes = [ Select [ (Just classes, collapseLists $ And tail), (Nothing, collapseLists $ Or nodes) ] ]
+        merge node nodes = node : nodes
 
-patternMachine Empty = Machine.empty
+selectifyNode node = node
 
-patternMachine (BeginToken name) = Machine.beginToken name
 
-patternMachine (EndToken name) = Machine.endToken name
+-- ** Machinize.
 
-patternMachine (EmptyToken name) = Machine.emptyToken name
 
-patternMachine (Choice name pattern) = Machine.sequential [ Machine.beginChoice name, patternMachineT pattern, Machine.endChoice name ]
+-- | @machinize index syntax@ converts each /syntax/ @Production@ to a single @Named@ machine using the /index/.
+machinize :: [ String ] -> Syntax -> [ Machine.Named ]
 
-patternMachine (Commit name) = Machine.commit name
+machinize index syntax = concatMap (productionMachines syntax) $ zip [1..] index
+  where productionMachines syntax (index, name) = catMaybes [ productionMachine syntax index name ]
+                                              ++ (map subMachine $ zip [1..] $ mapMaybe (productionMachine syntax index) $ map (contextify name) contexts)
+        subMachine (index, named) = named { Machine.nIndex = named|>Machine.nIndex ++ "." ++ show index }
+        parameterName (Variable name) = name
+        productionMachine syntax index name = case Map.lookup name syntax of
+                                                   Nothing                 -> Nothing
+                                                   Just (parameters, node) -> Just Machine.Named { Machine.nIndex = show index,
+                                                                                                   Machine.nName = name,
+                                                                                                   Machine.nParameters = map parameterName parameters,
+                                                                                                   Machine.nMachine = traced "Optimize" Machine.optimize $ traced "nodeMachine" nodeMachine $ node }
 
-patternMachine (RepeatN (Variable "n") pattern) = Machine.repeatN $ patternMachine pattern
 
-patternMachine (UptoN (Variable "n") pattern) = Machine.uptoExcludingN $ patternMachine pattern
+-- | @nodeMachine node@ Converts the /node/ to a @Machine@.
+nodeMachine :: Node -> Machine.Machine
 
-patternMachine (UptoN (Plus (Variable "n") (Value 1)) pattern) = Machine.uptoIncludingN $ patternMachine pattern
+nodeMachine (And nodes) = foldl merge Machine.empty nodes
+  where merge machine (PrefixError pattern) = Machine.prefixFailure machine $ traced "nodeMachine" nodeMachine pattern
+        merge machine node = Machine.sequential [ machine, traced "nodeMachine" nodeMachine node ]
 
-patternMachine (LoopN (Variable "n") pattern less equal) = Machine.loopN (patternMachine pattern) (patternMachine less) (patternMachine equal)
+nodeMachine (BeginToken name) = Machine.beginToken name
 
-patternMachine (ZeroOrMore (And [Classes classes, NextChar])) = Machine.zeroOrMoreClasses classes
+nodeMachine (Choice name pattern) = Machine.sequential [ Machine.beginChoice name, traced "nodeMachine" nodeMachine $ pattern, Machine.endChoice name ]
 
-patternMachine BadContext = Machine.badContext
+nodeMachine (Classes classes) = Machine.matchClasses classes
 
-patternMachine pattern = error $ "PM: " ++ show pattern
+nodeMachine (Commit name) = Machine.commit name
+
+nodeMachine Empty = Machine.empty
+
+nodeMachine (EmptyToken name) = Machine.emptyToken name
+
+nodeMachine (EndToken name) = Machine.endToken name
+
+nodeMachine (LoopN (Variable "n") pattern less equal) = Machine.loopN (traced "nodeMachine" nodeMachine pattern) (traced "nodeMachine" nodeMachine less) (traced "nodeMachine" nodeMachine equal)
+
+nodeMachine NextChar = Machine.nextChar
+
+nodeMachine NextLine = Machine.nextLine
+
+nodeMachine (RepeatN (Variable "n") pattern) = Machine.repeatN $ traced "nodeMachine" nodeMachine pattern
+
+nodeMachine (Select alternatives) = Machine.select $ map alternativeMachine alternatives
+  where alternativeMachine (selector, node) = (selector, traced "nodeMachine" nodeMachine $ node)
+
+nodeMachine (UptoN (Variable "n") pattern) = Machine.uptoExcludingN $ traced "nodeMachine" nodeMachine pattern
+
+nodeMachine (UptoN (Plus (Variable "n") (Value 1)) pattern) = Machine.uptoIncludingN $ traced "nodeMachine" nodeMachine pattern
+
+nodeMachine (ZeroOrMore (And [ Classes classes, NextChar ])) = Machine.zeroOrMoreClasses classes
+
+nodeMachine (ZeroOrMore pattern) = Machine.zeroOrMore $ traced "nodeMachine" nodeMachine pattern
+
+nodeMachine node = error $ "nodeMachine: " ++ show node
+
+
+-- * Directives.
+
+
+-- | @directives distinct machines@ converts the /distinct/ character sets and the @Named@ /machines/ to directives.
+directives :: ([ CharSet.CharSet ], [ Machine.Named ]) -> String
+
+directives (distinct, machines) = "BEGIN_SYNTAX\n"
+                               ++ "BEGIN_CLASSIFICATION\n"
+                               ++ CharSet.directives distinct
+                               ++ "END_CLASSIFICATION\n"
+                               ++ "BEGIN_MACHINES(" ++ (show $ length machines) ++ ")\n"
+                               ++ Machine.directives machines
+                               ++ "END_MACHINES(" ++ (show $ length machines) ++ ")\n"
+                               ++ "END_SYNTAX\n"
