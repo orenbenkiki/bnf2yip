@@ -13,6 +13,7 @@ module Machine (
     beginChoice,
     endChoice,
     commit,
+    unexpected,
     prefixFailure,
     finally,
     zeroOrMore,
@@ -66,6 +67,7 @@ data Action = BeginToken String
             | BadContext
             | BeginChoice String
             | Commit String
+            | DoneToken
             | EmptyToken String
             | EndChoice String
             | EndToken String
@@ -81,6 +83,7 @@ data Action = BeginToken String
             | ResetState
             | SetState
             | Success
+            | Unexpected
   deriving (Eq, Ord, Show)
 
 
@@ -103,10 +106,10 @@ counterLessThanN = -1000
 counterLessEqualN = -2000
 
 
--- | The number of special classes. This includes all the fake codes as well.
+-- | Special classes.
 specialClasses :: [ Int ]
 
-specialClasses = counterLessThanN : counterLessEqualN : map (+ length CharSet.fakeCodes) CharSet.fakeCodes
+specialClasses = [ counterLessThanN, counterLessEqualN ]
 
 
 -- * Create transitions.
@@ -199,6 +202,14 @@ actionMachine action = Map.fromList [ (0, actionState action 2),
                                       (2, successState) ]
 
 
+-- | @tokenActionMachine action@ creates a @Machine@ that performs a single /action/ that may cause a token to be returned.
+-- The @DoneToken@ is just a no-op, ensuring that the @State@ always unconditionally leads to a single following @State@.
+-- This following @State@ is where the @Machine@ continues from after the caller consumes the token.
+tokenActionMachine :: Action -> Machine
+
+tokenActionMachine action = Machine.sequential [ actionMachine action, actionMachine DoneToken ]
+
+
 -- | @nextChar@ creates a @Machine@ that consumes the next character.
 nextChar :: Machine
 
@@ -214,19 +225,19 @@ nextLine = actionMachine NextLine
 -- | @beginToken name@ creates a @Machine@ that begins collecting characters for a token with the given /name/.
 beginToken :: String -> Machine
 
-beginToken name = actionMachine $ BeginToken name
+beginToken name = tokenActionMachine $ BeginToken name
 
 
 -- | @endToken name@ creates a @Machine@ that ends collecting characters for a token with the given /name/.
 endToken :: String -> Machine
 
-endToken name = actionMachine $ EndToken name
+endToken name = tokenActionMachine $ EndToken name
 
 
 -- | @emptyToken name@ creates a @Machine@ that emits an empty token with the given /name/.
 emptyToken :: String -> Machine
 
-emptyToken name = actionMachine $ EmptyToken name
+emptyToken name = tokenActionMachine $ EmptyToken name
 
 
 -- | @beginChoice name@ creates a @Machine@ that marks the beginning of a named choice point with the given /name/.
@@ -238,13 +249,19 @@ beginChoice name = actionMachine $ BeginChoice name
 -- | @endChoice name@ creates a @Machine@ that marks the end of a named choice point with the given /name/.
 endChoice :: String -> Machine
 
-endChoice name = actionMachine $ EndChoice name
+endChoice name = tokenActionMachine $ EndChoice name
 
 
 -- | @commit name@ creates a @Machine@ that commits to the choice point of the given /name/.
 commit :: String -> Machine
 
-commit name = actionMachine $ Commit name
+commit name = tokenActionMachine $ Commit name
+
+
+-- | @unexpected@ creates a @Machine@ that emits an "unexpected character" error token.
+unexpected :: Machine
+
+unexpected = tokenActionMachine $ Unexpected
 
 
 -- * Complex machines.
@@ -369,12 +386,13 @@ uptoTestN :: Int -> Machine -> Machine
 uptoTestN test machine = insertList [ (0,                        actionState ResetCounter 1),
                                       (1,                        classesState (Set.fromList [ test ]) 2 (3 + Map.size machine + 0)),
                                       (2,                        actionState IncrementCounter 3),
-                                      (3 + Map.size machine - 2, gotoState $ 3 + Map.size machine + 3),
-                                      (3 + Map.size machine - 1, classesState (Set.fromList [ test ]) 2 (3 + Map.size machine + 1)),
-                                      (3 + Map.size machine + 0, actionState NonPositiveN $ 3 + Map.size machine + 2),
-                                      (3 + Map.size machine + 1, actionState PrevChar $ 3 + Map.size machine + 2),
-                                      (3 + Map.size machine + 2, failureState),
-                                      (3 + Map.size machine + 3, successState) ]
+                                      (3 + Map.size machine - 2, gotoState $ 3 + Map.size machine + 4),
+                                      (3 + Map.size machine - 1, classesState (Set.fromList [ test ]) 2 (3 + Map.size machine + 2)),
+                                      (3 + Map.size machine + 0, actionState NonPositiveN $ 3 + Map.size machine + 1),
+                                      (3 + Map.size machine + 1, actionState DoneToken $ 3 + Map.size machine + 4),
+                                      (3 + Map.size machine + 2, actionState PrevChar $ 3 + Map.size machine + 3),
+                                      (3 + Map.size machine + 3, failureState),
+                                      (3 + Map.size machine + 4, successState) ]
                          $ shiftIndices 3 machine
 
 
@@ -411,22 +429,50 @@ loopN machine less equal = insertList [ (0, actionState ResetCounter 1),
 -- It does not maintain the two final states at the end, but that's OK as this is the last step before emitting the directives.
 optimize :: Machine -> Machine
 
-optimize machine = fixpoint (traced "removeUnusedStates" removeUnusedStates
+optimize machine = traced "removeUnusedStates" removeUnusedStates
+                 $ traced "loopDone" loopDone
+                 $ fixpoint (traced "removeUnusedStates" removeUnusedStates
                            . traced "skipUnnecessaryEndTokens" skipUnnecessaryEndTokens
                            . traced "skipUnnecessaryUnparsed" skipUnnecessaryUnparsed
                            . traced "mergeIdenticalStates" mergeIdenticalStates
-                           . traced " mergeConsequtiveStates" mergeConsequtiveStates) machine
+                           . traced "mergeConsequtiveStates" mergeConsequtiveStates
+                           . traced "mergeSuccessFailure" mergeSuccessFailure) machine
+
+
+-- | @loopDone machine@ converts @EmptyToken "Done"@ to an endless "Done" token stream in the /machine/.
+-- This makes the end states unreachable.
+loopDone :: Machine -> Machine
+
+loopDone machine = Map.mapWithKey loop machine
+  where loop index state@(State { sAction = Just (EmptyToken "Done") }) = state { sTransitions = [ gotoTransition index ] }
+        loop _ state = state
+
+-- | @mergeSuccessFailure machine@ converts all @Failure@ states in the /machine/ to @Success@.
+-- This is only done on the final optimized machine which is assumed to include the end-of-production error handling logic.
+mergeSuccessFailure :: Machine -> Machine
+
+mergeSuccessFailure machine = Map.map merge machine
+  where merge state@(State { sAction = Just Failure }) = state { sAction = Just Success }
+        merge state = state
 
 
 -- | If one state always leads to another which has no action, then @mergeConsequtiveStates machine@ will merge them.
+-- A no-op will be preserved if it is the only way to ensure a single unconditional following @State@ after a token-generating action.
 mergeConsequtiveStates :: Machine -> Machine
 
 mergeConsequtiveStates machine = Map.map merge machine
   where merge state0@(State { sTransitions = [ Transition { tClasses = Nothing, tStateIndex = index1 } ] }) = let Just state1 = Map.lookup index1 machine
                                                                                                               in case (state0|>sAction, state1|>sAction) of
-                                                                                                                      (Nothing,         action ) -> state1
-                                                                                                                      (action,          Nothing) -> state1 { sAction = action }
-                                                                                                                      (_,               _      ) -> state0
+                                                                                                                      (Nothing,             action ) -> state1
+                                                                                                                      (Just DoneToken,      action ) -> state1
+                                                                                                                      (Just (BeginToken _), _      ) -> state0
+                                                                                                                      (Just (Commit _),     _      ) -> state0
+                                                                                                                      (Just (EmptyToken _), _      ) -> state0
+                                                                                                                      (Just (EndChoice _),  _      ) -> state0
+                                                                                                                      (Just (EndToken _),   _      ) -> state0
+                                                                                                                      (Just Unexpected,     _      ) -> state0
+                                                                                                                      (action,              Nothing) -> state1 { sAction = action }
+                                                                                                                      (_,                   _      ) -> state0
         merge state = state
 
 
@@ -516,7 +562,6 @@ skipUnnecessaryEndTokens machine = let stateTokens = unendedTokens machine
                                                     if "End" `isPrefixOf` name && not (Set.member (drop 3 name) tokens)
                                                        then transition { tStateIndex = index }
                                                        else transition
-                                                  State { sAction = Just (EmptyToken _) } -> error $ "fixTransition: " ++ show state
                                                   _ -> transition
 
 
@@ -582,7 +627,7 @@ spoilName name   = name''
 stateDirectives :: (Int, State) -> String
 
 stateDirectives (index, state) = "BEGIN_STATE(" ++ show index ++ ")\n"
-                              ++ (actionDirective $ state|>sAction)
+                              ++ (actionDirective state $ state|>sAction)
                               ++ "BEGIN_TRANSITIONS(" ++ (show $ length $ state|>sTransitions) ++ ")\n"
                               ++ (concatMap transitionDirectives $ zip [0..] $ state|>sTransitions)
                               ++ "END_TRANSITIONS(" ++ (show $ length $ state|>sTransitions) ++ ")\n"
@@ -590,56 +635,63 @@ stateDirectives (index, state) = "BEGIN_STATE(" ++ show index ++ ")\n"
 
 
 -- | @actionDirective action@ converts an /action/ to a directive.
-actionDirective :: Maybe Action -> String
+actionDirective :: State -> Maybe Action -> String
 
-actionDirective Nothing = "NO_ACTION\n"
+actionDirective _ Nothing = "NO_ACTION\n"
 
-actionDirective (Just NextChar) = "NEXT_CHAR\n"
+actionDirective _ (Just BadContext) = "BAD_CONTEXT\n"
 
-actionDirective (Just PrevChar) = "PREV_CHAR\n"
+actionDirective _ (Just (BeginChoice name)) = "BEGIN_CHOICE(" ++ name ++ ")\n"
 
-actionDirective (Just NextLine) = "NEXT_LINE\n"
+actionDirective state (Just (BeginToken name)) = "BEGIN_TOKEN(" ++ name ++ ", " ++ doneTokenIndex state ++ ")\n"
 
-actionDirective (Just (BeginToken name)) = "BEGIN_TOKEN(" ++ name ++ ")\n"
+actionDirective state (Just (Commit name)) = "COMMIT(" ++ name ++ ", " ++ doneTokenIndex state ++ ")\n"
 
-actionDirective (Just (EndToken name)) = "END_TOKEN(" ++ name ++ ")\n"
+actionDirective _ (Just DoneToken) = "NO_ACTION\n"
 
-actionDirective (Just (EmptyToken name)) = "EMPTY_TOKEN(" ++ name ++ ")\n"
+actionDirective state (Just (EmptyToken name)) = "EMPTY_TOKEN(" ++ name ++ ", " ++ doneTokenIndex state ++ ")\n"
 
-actionDirective (Just (BeginChoice name)) = "BEGIN_CHOICE(" ++ name ++ ")\n"
+actionDirective state (Just (EndChoice name)) = "END_CHOICE(" ++ name ++ ", " ++ doneTokenIndex state ++ ")\n"
 
-actionDirective (Just (EndChoice name)) = "END_CHOICE(" ++ name ++ ")\n"
+actionDirective state (Just (EndToken name)) = "END_TOKEN(" ++ name ++ ", " ++ doneTokenIndex state ++ ")\n"
 
-actionDirective (Just (Commit name)) = "COMMIT(" ++ name ++ ")\n"
+actionDirective _ (Just IncrementCounter) = "INCREMENT_COUNTER\n"
 
-actionDirective (Just PushState) = "PUSH_STATE\n"
+actionDirective _ (Just NextChar) = "NEXT_CHAR\n"
 
-actionDirective (Just SetState) = "SET_STATE\n"
+actionDirective _ (Just NextLine) = "NEXT_LINE\n"
 
-actionDirective (Just ResetState) = "RESET_STATE\n"
+actionDirective state (Just NonPositiveN) = "NON_POSITIVE_N(" ++ doneTokenIndex state ++ ")\n"
 
-actionDirective (Just PopState) = "POP_STATE\n"
+actionDirective _ (Just PopState) = "POP_STATE\n"
 
-actionDirective (Just ResetCounter) = "RESET_COUNTER\n"
+actionDirective _ (Just PrevChar) = "PREV_CHAR\n"
 
-actionDirective (Just IncrementCounter) = "INCREMENT_COUNTER\n"
+actionDirective _ (Just PushState) = "PUSH_STATE\n"
 
-actionDirective (Just NonPositiveN) = "NON_POSITIVE_N\n"
+actionDirective _ (Just ResetCounter) = "RESET_COUNTER\n"
 
-actionDirective (Just BadContext) = "BAD_CONTEXT\n"
+actionDirective _ (Just ResetState) = "RESET_STATE\n"
 
-actionDirective (Just Success) = "SUCCESS\n"
+actionDirective _ (Just SetState) = "SET_STATE\n"
 
-actionDirective (Just Failure) = "FAILURE\n"
+actionDirective state (Just Unexpected) = "UNEXPECTED(" ++ doneTokenIndex state ++ ")\n"
+
+
+-- | @doneTokenIndex state@ returns the index of the @State@ that immediatly follows the current /state/.
+-- This allows the caller to continue from that following @State@ after consuming the token generated in this /state/.
+doneTokenIndex :: State -> String
+
+doneTokenIndex (State { sTransitions = [ Transition { tClasses = Nothing, tStateIndex = index } ] }) = show index
 
 
 -- | @transitionDirectives (index, transition)@ converts a /transition/ with an /index/ to a list of directives.
 transitionDirectives :: (Int, Transition) -> String
 
-transitionDirectives (index, transition) = "BEGIN_TRANSITION(" ++ show index ++ ", " ++ show state_index ++ ")\n"
+transitionDirectives (index, transition) = "BEGIN_TRANSITION(" ++ show index ++ ", " ++ show (transition|>tStateIndex) ++ ")\n"
                                         ++ fake_directives
                                         ++ real_directives
-                                        ++ "END_TRANSITION(" ++ show index ++ ", " ++ show state_index ++ ")\n"
+                                        ++ "END_TRANSITION(" ++ show index ++ ", " ++ show (transition|>tStateIndex) ++ ")\n"
   where state_index = transition|>tStateIndex
         fake_classes = Set.intersection (fromMaybe Set.empty $ transition|>tClasses) $ Set.fromList specialClasses
         real_classes = Set.difference (fromMaybe Set.empty $ transition|>tClasses) $ Set.fromList specialClasses
@@ -650,14 +702,13 @@ transitionDirectives (index, transition) = "BEGIN_TRANSITION(" ++ show index ++ 
 -- | @classDirectives index@ converts a class with an /index/ to a directive.
 classDirectives :: Int -> String
 
-classDirectives index = "CLASS(" ++ show (index - length CharSet.fakeCodes) ++ ")\n"
+classDirectives index = "CLASS(" ++ show index ++ ")\n"
 
 
 -- | @fakeDirectives index@ converts a fake class with an /index/ to a directive.
 fakeDirectives :: Int -> String
 
 fakeDirectives index
-  | index == length CharSet.fakeCodes + CharSet.startOfLine = "START_OF_LINE\n"
   | index == counterLessThanN  = "COUNTER_LESS_THAN_N\n"
   | index == counterLessEqualN = "COUNTER_LESS_EQUAL_N\n"
   | otherwise = error ("FD: " ++ show index)

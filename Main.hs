@@ -132,7 +132,8 @@ main = do args <- getArgs
 -- | @prepare syntax@ performs all the one-time preparations of the parsed /syntax/ before optimization.
 prepare :: Syntax -> Syntax
 
-prepare syntax = (mapSyntax $ traced "purgePeeks" purgePeeks)
+prepare syntax = (traced "wrapProduction" $ Map.map wrapProduction)
+               $ (mapSyntax $ traced "purgePeeks" purgePeeks)
                $ (traced "filter" $ Map.filter (notElem BadContext . listNode . snd))
                $ (\syntax -> (mapSyntax $ traced "inline" (inline syntax Set.empty)) syntax)
                $ (traced "decontext" $ Map.fromList . concatMap decontext . Map.toList)
@@ -159,6 +160,8 @@ simplify node@(Choice _ _) = node
 
 simplify node@(Commit _) = node
 
+simplify EndOfFile = Chars $ CharSet.fake $ CharSet.endOfFile
+
 simplify node@NextChar = node
 
 simplify node@NextLine = node
@@ -175,7 +178,7 @@ simplify (RepeatN (Value times) pattern) = And $ replicate times pattern
 
 simplify node@(RepeatN _ _) = node
 
-simplify node@StartOfLine = Chars $ CharSet.fake $ CharSet.startOfLine
+simplify StartOfLine = Chars $ CharSet.fake $ CharSet.startOfLine
 
 simplify node@(Symbol _) = node
 
@@ -268,6 +271,8 @@ purgePeeks node@(And _) = node
 
 purgePeeks node@(BeginToken _) = node
 
+purgePeeks node@(Case _ _) = node
+
 purgePeeks node@(Chars _) = node
 
 purgePeeks node@(Choice _ _) = node
@@ -292,6 +297,8 @@ purgePeeks node@(PrefixError _) = node
 
 purgePeeks node@(RepeatN _ _) = node
 
+purgePeeks node@(Symbol _) = node
+
 purgePeeks node@(UptoN _ _) = node
 
 purgePeeks node@(Value _) = node
@@ -313,6 +320,19 @@ purgePeekActions node@NextChar = node
 purgePeekActions node@(Or _) = node
 
 purgePeekActions node = error $ "purgePeekActions: " ++ show node
+
+
+-- | @wrapProduction production@ wraps the /production/ in additional logic.
+-- This logic ensures uncollected/unconsumed characters are properly reported, and a "Done" token is generated at the end.
+wrapProduction :: Production -> Production
+
+wrapProduction (parameters, pattern) = (parameters, And [ BeginToken "Unparsed",
+                                                          pattern,
+                                                          PrefixError (EndToken "Unparsed"),
+                                                          EndToken "Unparsed",
+                                                          Chars $ CharSet.fake $ CharSet.endOfFile,
+                                                          PrefixError $ And [ Unexpected, EmptyToken "Done" ],
+                                                          EmptyToken "Done" ])
 
 
 -- * Optimize.
@@ -496,6 +516,16 @@ shouldFlip (And nodes) node = foldr (&&) True $ map ((flip shouldFlip) node) nod
 
 shouldFlip node (And nodes) = foldr (&&) True $ map (shouldFlip node) nodes
 
+shouldFlip (AndNot base _) node = shouldFlip base node
+
+shouldFlip node (AndNot base _) = shouldFlip node base
+
+shouldFlip (Case _ alternatives) node = foldr (&&) True $ map flipAlternative alternatives
+  where flipAlternative (_, pattern) = shouldFlip pattern node
+
+shouldFlip node (Case _ alternatives) = foldr (&&) True $ map flipAlternative alternatives
+  where flipAlternative (_, pattern) = shouldFlip node pattern
+
 shouldFlip (Choice _ pattern) node = shouldFlip pattern node
 
 shouldFlip node (Choice _ pattern) = shouldFlip node pattern
@@ -547,6 +577,10 @@ keepOrder (Chars _) (Chars _) = True
 
 keepOrder (Chars _) (Commit _) = True
 
+keepOrder (Chars _) NextLine = True
+
+keepOrder (Chars _) Unexpected = True
+
 keepOrder (EmptyToken _) (EmptyToken _) = True
 
 keepOrder (EmptyToken _) (EndToken _) = True
@@ -561,6 +595,8 @@ keepOrder NextChar (EndToken _) = True
 
 keepOrder NextChar NextLine = True
 
+keepOrder Unexpected (EmptyToken _) = True
+
 keepOrder _ _ = False
 
 
@@ -568,13 +604,11 @@ keepOrder _ _ = False
 -- If it returns @Nothing@, try reversing the order (and the result).
 switchOrder :: Node -> Node -> Maybe Bool
 
-switchOrder (Chars _) (BeginToken _) = Just False
+switchOrder (Chars chars) (BeginToken _) = Just $ chars == CharSet.fake CharSet.endOfFile
 
-switchOrder (Chars _) (EmptyToken _) = Just False
+switchOrder (Chars chars) (EmptyToken _) = Just $ chars == CharSet.fake CharSet.endOfFile
 
-switchOrder (Chars _) (EndToken _) = Just False
-
-switchOrder (Chars _) NextLine = Just False
+switchOrder (Chars chars) (EndToken _) = Just True
 
 switchOrder (Commit _) (BeginToken _) = Just False
 
@@ -607,7 +641,7 @@ finalize index syntax = let distinct = distinctSets syntax
 -- | @distinctSets syntax@ computes the distinct sets of characters that are equivalent as far as the /syntax/ is concerned.
 distinctSets :: Syntax -> [ CharSet.CharSet ]
 
-distinctSets syntax = CharSet.distinct $ map CharSet.fake CharSet.fakeCodes ++ (mapMaybe nodeChars $ listSyntax syntax)
+distinctSets syntax = CharSet.distinct $ mapMaybe nodeChars $ listSyntax syntax
                       where nodeChars (Chars chars) = Just chars
                             nodeChars _ = Nothing
 
@@ -706,6 +740,8 @@ nodeMachine (RepeatN (Variable "n") pattern) = Machine.repeatN $ traced "nodeMac
 nodeMachine (Select alternatives) = Machine.select $ map alternativeMachine alternatives
   where alternativeMachine (selector, node) = (selector, traced "nodeMachine" nodeMachine $ node)
 
+nodeMachine Unexpected = Machine.unexpected
+
 nodeMachine (UptoN (Variable "n") pattern) = Machine.uptoExcludingN $ traced "nodeMachine" nodeMachine pattern
 
 nodeMachine (UptoN (Plus (Variable "n") (Value 1)) pattern) = Machine.uptoIncludingN $ traced "nodeMachine" nodeMachine pattern
@@ -724,9 +760,9 @@ nodeMachine node = error $ "nodeMachine: " ++ show node
 directives :: ([ CharSet.CharSet ], [ Machine.Named ]) -> String
 
 directives (distinct, machines) = "BEGIN_SYNTAX\n"
-                               ++ "BEGIN_CLASSIFICATION\n"
+                               ++ "BEGIN_CLASSIFICATION(" ++ show (length distinct) ++ ")\n"
                                ++ CharSet.directives distinct
-                               ++ "END_CLASSIFICATION\n"
+                               ++ "END_CLASSIFICATION(" ++ show (length distinct) ++ ")\n"
                                ++ "BEGIN_MACHINES(" ++ (show $ length machines) ++ ")\n"
                                ++ Machine.directives machines
                                ++ "END_MACHINES(" ++ (show $ length machines) ++ ")\n"

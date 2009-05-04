@@ -1,7 +1,7 @@
 module CharSet (
  CharSet,
+ endOfFile,
  startOfLine,
- fakeCodes,
  empty,
  singleton,
  fake,
@@ -36,16 +36,22 @@ maxLowCode :: Int
 maxLowCode = 159
 
 
+-- | Almost-fake character code for testing for the end of the input.
+endOfFile :: Int
+
+endOfFile = -1
+
+
 -- | Fake character code for testing for the start of a line.
 startOfLine :: Int
 
-startOfLine = -1
+startOfLine = -2
 
 
--- | A list of all the fake codes (but not the special ones).
+-- | A list of all the fake codes.
 fakeCodes :: [ Int ]
 
-fakeCodes = [ startOfLine ]
+fakeCodes = [ endOfFile, startOfLine ]
 
 
 -- * Create new sets.
@@ -200,7 +206,7 @@ subtractRanges ranges1 ranges2 = error $ "SUB_RANGES: " ++ show ranges1 ++ " - "
 -- Each character contained in any of the original sets is contained in exactly one of the distinct sets.
 distinct :: [ CharSet ] -> [ CharSet ]
 
-distinct sets = sortBy compare' $ snd $ foldr addDistinct (empty, []) sets
+distinct sets = sortBy compare' $ snd $ foldr addDistinct (empty, []) $ map fake fakeCodes ++ sets
   where compare' left right = compare (spoil left) (spoil right)
         spoil ([], ranges) = ([ 999999 ], ranges)
         spoil charSet = charSet
@@ -238,9 +244,9 @@ distinctSets chars distinct@(head : tail)
 -- | @directives sets@ computes a list of directives for classifying characters using the distinct /sets/.
 directives :: [ CharSet ] -> String
 
-directives distinct = "BEGIN_CLASSIFICATION_TABLE(" ++ (show $ 1 + maxLowCode) ++ ")\n"
+directives distinct = "BEGIN_CLASSIFICATION_TABLE(" ++ (show $ 2 {- EOF, NUL -} + maxLowCode) ++ ")\n"
                    ++ classificationTable distinct
-                   ++ "END_CLASSIFICATION_TABLE(" ++ (show $ 1 + maxLowCode) ++ ")\n"
+                   ++ "END_CLASSIFICATION_TABLE(" ++ (show $ 2 {- EOF, NUL -} + maxLowCode) ++ ")\n"
                    ++ "BEGIN_CLASSIFICATION_RANGES\n"
                    ++ classificationRanges distinct
                    ++ "END_CLASSIFICATION_RANGES\n"
@@ -249,17 +255,17 @@ directives distinct = "BEGIN_CLASSIFICATION_TABLE(" ++ (show $ 1 + maxLowCode) +
 -- | @classificationTable distinct@ computes a table assigning a class index to each low character code.
 classificationTable :: [ CharSet ] -> String
 
-classificationTable distinct = concatMap codeClass [0 .. maxLowCode]
+classificationTable distinct = concatMap codeClass [endOfFile..maxLowCode]
   where codeClass code = "LOW_CHAR_CLASS(" ++ show code
                       ++ ", " ++ show (classIndex code)
                       ++ ")\n"
-        classIndex code = (fromMaybe 0 $ findIndex (member code) distinct) - length fakeCodes
+        classIndex code = fromMaybe (-1) $ findIndex (member code) distinct
 
 
 -- | @classificationTable distinct@ computes a set of tests for classifying high character codes.
 classificationRanges :: [ CharSet ] -> String
 
-classificationRanges distinct = concatMap rangesTests $ zip [- length fakeCodes ..] distinct
+classificationRanges distinct = concatMap rangesTests $ zip [0..] distinct
   where rangesTests (index, (_, ranges)) = concatMap (rangeTest index) ranges
         rangeTest index (low, high) = "HIGH_CHAR_RANGE(" ++ (show $ index)
                                    ++ ", " ++ (show low)

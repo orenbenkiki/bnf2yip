@@ -65,6 +65,7 @@ data Node = And [ Node ]
           | StartOfLine
           | Symbol String
           | Token String Node
+          | Unexpected
           | UptoN Node Node
           | Value Int
           | Variable String

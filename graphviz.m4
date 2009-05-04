@@ -68,11 +68,10 @@ divert(-1)
 
 define(`NOP_COLOR', `#DFDFDF')
 define(`FAILURE_COLOR', `#FF9999')
-define(`SUCCESS_COLOR', `#99FF99')
+define(`TOKEN_COLOR', `#99FF99')
 define(`CHOICE_COLOR', `#9999FF')
 define(`STATE_COLOR', `#99EEEE')
-define(`CHAR_COLOR', `#FFFF99')
-define(`TOKEN_COLOR', `#FFDFDF')
+define(`CHAR_COLOR', `#EEEE99')
 define(`COUNTER_COLOR', `#EE99EE')
 
 define(`NO_ACTION', `
@@ -201,18 +200,10 @@ divert(1)dnl
 divert(-1)
 ')
 
-
-define(`FAILURE', `
+define(`UNEXPECTED', `
 define(`FILL_COLOR', `FAILURE_COLOR')
 divert(1)dnl
- | Failure`'dnl
-divert(-1)
-')
-
-define(`SUCCESS', `
-define(`FILL_COLOR', `SUCCESS_COLOR')
-divert(1)dnl
- | Success`'dnl
+ | Unexpected`'dnl
 divert(-1)
 ')
 
