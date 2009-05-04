@@ -265,7 +265,7 @@ inline syntax callers node = node
 -- | @purgePeeks node@ purges any side-effect actions from inside a peek /node/.
 purgePeeks :: Node -> Node
 
-purgePeeks (AndNot base subtract) = AndNot base $ purgePeekActions subtract
+purgePeeks (AndNot base subtract) = AndNot base $ mapNode purgePeekActions subtract
 
 purgePeeks node@(And _) = node
 
@@ -314,6 +314,14 @@ purgePeeks node = error $ "purgePeeks: " ++ show node
 purgePeekActions :: Node -> Node
 
 purgePeekActions node@(And _) = node
+
+purgePeekActions node@(BeginToken _) = Empty
+
+purgePeekActions node@(Chars _) = node
+
+purgePeekActions node@(EndToken _) = Empty
+
+purgePeekActions node@(PrefixError _) = node
 
 purgePeekActions node@NextChar = node
 
@@ -459,7 +467,6 @@ mergeOrLoops (Or nodes) = Or $ foldr merge [] nodes
 
 mergeOrLoops node = node
 
-
 -- | @removeAndEmpties node@ removes @Empty@ nodes from and @And@ /node/ sub-nodes list.
 removeAndEmpties :: Node -> Node
 
@@ -529,6 +536,10 @@ shouldFlip node (Case _ alternatives) = foldr (&&) True $ map flipAlternative al
 shouldFlip (Choice _ pattern) node = shouldFlip pattern node
 
 shouldFlip node (Choice _ pattern) = shouldFlip node pattern
+
+shouldFlip Empty _ = False
+
+shouldFlip _ Empty = False
 
 shouldFlip (LoopN times pattern less equal) node = shouldFlip pattern node && shouldFlip less node && shouldFlip equal node
 
@@ -608,7 +619,7 @@ switchOrder (Chars chars) (BeginToken _) = Just $ chars == CharSet.fake CharSet.
 
 switchOrder (Chars chars) (EmptyToken _) = Just $ chars == CharSet.fake CharSet.endOfFile
 
-switchOrder (Chars chars) (EndToken _) = Just True
+switchOrder (Chars _) (EndToken _) = Just True
 
 switchOrder (Commit _) (BeginToken _) = Just False
 
@@ -735,16 +746,16 @@ nodeMachine NextChar = Machine.nextChar
 
 nodeMachine NextLine = Machine.nextLine
 
-nodeMachine (RepeatN (Variable "n") pattern) = Machine.repeatN $ traced "nodeMachine" nodeMachine pattern
+nodeMachine (RepeatN (Variable "n") pattern@(And [ Classes classes, NextChar ])) = Machine.repeatN classes
 
 nodeMachine (Select alternatives) = Machine.select $ map alternativeMachine alternatives
   where alternativeMachine (selector, node) = (selector, traced "nodeMachine" nodeMachine $ node)
 
 nodeMachine Unexpected = Machine.unexpected
 
-nodeMachine (UptoN (Variable "n") pattern) = Machine.uptoExcludingN $ traced "nodeMachine" nodeMachine pattern
+nodeMachine (UptoN (Variable "n") pattern@(And [ Classes classes, NextChar ])) = Machine.uptoExcludingN classes
 
-nodeMachine (UptoN (Plus (Variable "n") (Value 1)) pattern) = Machine.uptoIncludingN $ traced "nodeMachine" nodeMachine pattern
+nodeMachine (UptoN (Plus (Variable "n") (Value 1)) pattern@(And [ Classes classes, NextChar ])) = Machine.uptoIncludingN classes
 
 nodeMachine (ZeroOrMore (And [ Classes classes, NextChar ])) = Machine.zeroOrMoreClasses classes
 

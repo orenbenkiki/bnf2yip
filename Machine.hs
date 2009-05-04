@@ -2,7 +2,6 @@ module Machine (
     Named(..),
     Machine,
     empty,
-    badContext,
     matchClasses,
     zeroOrMoreClasses,
     nextChar,
@@ -64,7 +63,6 @@ data State = State {
 
 -- | Action performed when entering a @State@.
 data Action = BeginToken String
-            | BadContext
             | BeginChoice String
             | Commit String
             | DoneToken
@@ -75,7 +73,6 @@ data Action = BeginToken String
             | IncrementCounter
             | NextChar
             | NextLine
-            | NonPositiveN
             | PopState
             | PrevChar
             | PushState
@@ -165,15 +162,6 @@ empty :: Machine
 empty = Map.fromList [ (0, gotoState 2),
                        (1, failureState),
                        (2, successState) ]
-
-
--- | A @Machine@ that always fails due to an unexpected context parameter.
--- This "never happens", except when creating machines for testing productions.
-badContext :: Machine
-
-badContext = Map.fromList [ (0, actionState BadContext 1),
-                            (1, failureState),
-                            (2, successState) ]
 
 
 -- | @matchClasses classes@ creates a @Machine@ that succeeds if the current character belongs to one of the /classes/.
@@ -365,47 +353,44 @@ select alternatives = let (successIndices, failureIndices, transitions, machine)
           | otherwise                = Just (stateIndex, gotoState finalIndex)
 
 
--- | @repeatN machine@ returns a new @Machine@ that repeats the given /machine/ exactly the number of times specified in the /n/ variable.
+-- | @repeatN classes@ returns a new @Machine@ that consumes the given /classes/ exactly the number of times specified in the /n/ variable.
 -- If /n/ is negative ("never happens") it is taken to mean zero.
-repeatN :: Machine -> Machine
+repeatN :: Set.Set Int -> Machine
 
-repeatN machine = insertList [ (0,                        actionState ResetCounter 1),
-                               (1,                        classesState (Set.fromList [ counterLessThanN ]) 2 (3 + Map.size machine + 1)),
-                               (2,                        actionState IncrementCounter 3),
-                               (3 + Map.size machine - 2, gotoState $ 3 + Map.size machine + 0),
-                               (3 + Map.size machine - 1, gotoState 1),
-                               (3 + Map.size machine + 0, failureState),
-                               (3 + Map.size machine + 1, successState) ]
-                $ shiftIndices 3 machine
-
-
--- | @uptoN machine@ returns a new @Machine@ that repeats the given atomic /machine/ as long as some /test/ (fake class) is not satisfied.
--- This never fails (unless /n/ is negative, which "never happens").
-uptoTestN :: Int -> Machine -> Machine
-
-uptoTestN test machine = insertList [ (0,                        actionState ResetCounter 1),
-                                      (1,                        classesState (Set.fromList [ test ]) 2 (3 + Map.size machine + 0)),
-                                      (2,                        actionState IncrementCounter 3),
-                                      (3 + Map.size machine - 2, gotoState $ 3 + Map.size machine + 4),
-                                      (3 + Map.size machine - 1, classesState (Set.fromList [ test ]) 2 (3 + Map.size machine + 2)),
-                                      (3 + Map.size machine + 0, actionState NonPositiveN $ 3 + Map.size machine + 1),
-                                      (3 + Map.size machine + 1, actionState DoneToken $ 3 + Map.size machine + 4),
-                                      (3 + Map.size machine + 2, actionState PrevChar $ 3 + Map.size machine + 3),
-                                      (3 + Map.size machine + 3, failureState),
-                                      (3 + Map.size machine + 4, successState) ]
-                         $ shiftIndices 3 machine
+repeatN classes = Map.fromList [ (0, actionState ResetCounter 1),
+                                 (1, classesState (Set.fromList [ counterLessThanN ]) 2 6),
+                                 (2, actionState IncrementCounter 3),
+                                 (3, classesState classes 4 5),
+                                 (4, actionState NextChar 1),
+                                 (5, failureState),
+                                 (6, successState) ]
 
 
--- | @uptoN machine@ returns a new @Machine@ that repeats the given @machine@ upto (but not including) a specific number of times.
-uptoExcludingN :: Machine -> Machine
+-- | @uptoN classes test@ returns a new @Machine@ that consumes the given /classes/ as long as some /test/ (special class) is not satisfied.
+-- If the following character belongs to the /classes/, the @Machine@ fails.
+uptoTestN :: Set.Set Int -> Int -> Machine
 
-uptoExcludingN machine = uptoTestN counterLessThanN machine
+uptoTestN classes test = Map.fromList [ (0, actionState ResetCounter 1),
+                                        (1, actionState IncrementCounter 2),
+                                        (2, classesState (Set.fromList [ test ]) 3 5),
+                                        (3, classesState classes 4 7),
+                                        (4, actionState NextChar 1),
+                                        (5, classesState classes 6 7),
+                                        (6, failureState),
+                                        (7, successState) ]
+
+-- | @uptoN classes@ returns a new @Machine@ that consumes /classes/ upto (but not including) a specific number of times.
+-- If the following character belongs to the /classes/, the @Machine@ fails.
+uptoExcludingN :: Set.Set Int -> Machine
+
+uptoExcludingN classes = uptoTestN classes counterLessThanN
 
 
--- | @uptoIncludingN machine@ returns a new @Machine@ that repeats the given @machine@ upto and including a specific number of times.
-uptoIncludingN :: Machine -> Machine
+-- | @uptoIncludingN classes@ returns a new @Machine@ that consumes /classes/ upto and not including a specific number of times.
+-- If the following character belongs to the /classes/, the @Machine@ fails.
+uptoIncludingN :: Set.Set Int -> Machine
 
-uptoIncludingN machine = uptoTestN counterLessEqualN machine
+uptoIncludingN classes = uptoTestN classes counterLessEqualN
 
 
 -- @loopN machine less equal@ returns a new @Machine@ that repeats /machine/ up to and including a specific number of times.
@@ -639,8 +624,6 @@ actionDirective :: State -> Maybe Action -> String
 
 actionDirective _ Nothing = "NO_ACTION\n"
 
-actionDirective _ (Just BadContext) = "BAD_CONTEXT\n"
-
 actionDirective _ (Just (BeginChoice name)) = "BEGIN_CHOICE(" ++ name ++ ")\n"
 
 actionDirective state (Just (BeginToken name)) = "BEGIN_TOKEN(" ++ name ++ ", " ++ doneTokenIndex state ++ ")\n"
@@ -660,8 +643,6 @@ actionDirective _ (Just IncrementCounter) = "INCREMENT_COUNTER\n"
 actionDirective _ (Just NextChar) = "NEXT_CHAR\n"
 
 actionDirective _ (Just NextLine) = "NEXT_LINE\n"
-
-actionDirective state (Just NonPositiveN) = "NON_POSITIVE_N(" ++ doneTokenIndex state ++ ")\n"
 
 actionDirective _ (Just PopState) = "POP_STATE\n"
 

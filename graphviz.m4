@@ -186,20 +186,6 @@ divert(1)dnl
 divert(-1)
 ')
 
-define(`NON_POSITIVE_N', `
-define(`FILL_COLOR', `FAILURE_COLOR')
-divert(1)dnl
- | NonPositiveN`'dnl
-divert(-1)
-')
-
-define(`BAD_CONTEXT', `
-define(`FILL_COLOR', `FAILURE_COLOR')
-divert(1)dnl
- | BadContext`'dnl
-divert(-1)
-')
-
 define(`UNEXPECTED', `
 define(`FILL_COLOR', `FAILURE_COLOR')
 divert(1)dnl
