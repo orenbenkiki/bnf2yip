@@ -11,8 +11,6 @@
 -- Convert the reference BNF file to a list of directives for further processing, e.g. as a basis for generating a parser.
 -- Since this is a one-time operation, efficiency is most emphatically not a consideration in this code.
 
--- TODO: 29: Unparsed
-
 module Main(main)
 where
 
@@ -192,6 +190,8 @@ simplify node@(Variable _) = node
 
 simplify (WrapTokens beginToken endToken pattern) = And [ EmptyToken beginToken, pattern, EmptyToken endToken, PrefixError $ EmptyToken endToken ]
 
+simplify node@(ZeroOrMore _) = node
+
 simplify node = error $ "simplify: " ++ show node
 
 
@@ -332,10 +332,10 @@ purgePeekActions node = error $ "purgePeekActions: " ++ show node
 
 -- | @wrapProduction production@ wraps the /production/ in additional logic.
 -- This logic ensures uncollected/unconsumed characters are properly reported, and a "Done" token is generated at the end.
+-- An "Unparsed" token is assumed to be automatically started by the implementation of the state machine.
 wrapProduction :: Production -> Production
 
-wrapProduction (parameters, pattern) = (parameters, And [ BeginToken "Unparsed",
-                                                          pattern,
+wrapProduction (parameters, pattern) = (parameters, And [ pattern,
                                                           PrefixError (EndToken "Unparsed"),
                                                           EndToken "Unparsed",
                                                           Chars $ CharSet.fake $ CharSet.endOfFile,
@@ -745,6 +745,8 @@ nodeMachine (LoopN (Variable "n") pattern less equal) = Machine.loopN (traced "n
 nodeMachine NextChar = Machine.nextChar
 
 nodeMachine NextLine = Machine.nextLine
+
+nodeMachine (Or nodes) = Machine.alternatives $ map (traced "nodeMachine" nodeMachine) nodes
 
 nodeMachine (RepeatN (Variable "n") pattern@(And [ Classes classes, NextChar ])) = Machine.repeatN classes
 

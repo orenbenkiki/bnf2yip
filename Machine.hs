@@ -69,6 +69,7 @@ data Action = BeginToken String
             | EmptyToken String
             | EndChoice String
             | EndToken String
+            | EndUnparsed Int
             | Failure
             | IncrementCounter
             | NextChar
@@ -294,12 +295,14 @@ finally machine suffix = sequential [ prefixFailure machine suffix, suffix ]
 zeroOrMore :: Machine -> Machine
 
 zeroOrMore machine = insertList [ (0,                        actionState PushState 1),
-                                  (1 + Map.size machine - 2, gotoState $ 1 + Map.size machine + 1),
+                                  (1 + Map.size machine - 2, gotoState $ 1 + Map.size machine + 2),
                                   (1 + Map.size machine - 1, gotoState $ 1 + Map.size machine + 0),
-                                  (1 + Map.size machine + 0, actionState SetState 1),
-                                  (1 + Map.size machine + 1, actionState PopState $ 1 + Map.size machine + 3),
-                                  (1 + Map.size machine + 2, failureState),
-                                  (1 + Map.size machine + 3, successState) ]
+                                  (1 + Map.size machine + 0, actionState SetState $ 1 + Map.size machine + 1),
+                                  (1 + Map.size machine + 1, actionState DoneToken 1),
+                                  (1 + Map.size machine + 2, actionState ResetState $ 1 + Map.size machine + 3),
+                                  (1 + Map.size machine + 3, actionState PopState $ 1 + Map.size machine + 5),
+                                  (1 + Map.size machine + 4, failureState),
+                                  (1 + Map.size machine + 5, successState) ]
                    $ shiftIndices 1 machine
 
 
@@ -310,7 +313,6 @@ sequential machines = foldr1 merge machines
   where merge first second = insertList [ (Map.size first - 2, gotoState $ Map.size first + Map.size second - 2),
                                           (Map.size first - 1, gotoState $ Map.size first) ]
                            $ appendMachine first second
-
 
 -- | @alternatives machines@ returns a new @Machine@ that tries each of the alternative /machines/ in turn.
 alternatives :: [ Machine ] -> Machine
@@ -327,7 +329,6 @@ alternatives (first : rest) = let first' = alternative (actionMachine PushState)
         merge first second = insertList [ (Map.size first - 2, gotoState $ Map.size first),
                                           (Map.size first - 1, gotoState $ Map.size first + Map.size second - 1) ]
                            $ appendMachine first second
-
 
 -- | @select [ (Maybe classes, machine) ]@ returns a new @Machine@ that merges several /machine/s,
 -- given each of them is only applicable if the current character belongs to some /classes/.
@@ -417,7 +418,7 @@ optimize :: Machine -> Machine
 optimize machine = traced "removeUnusedStates" removeUnusedStates
                  $ traced "loopDone" loopDone
                  $ fixpoint (traced "removeUnusedStates" removeUnusedStates
-                           . traced "skipUnnecessaryEndTokens" skipUnnecessaryEndTokens
+                           -- . traced "skipUnnecessaryEndTokens" skipUnnecessaryEndTokens
                            . traced "skipUnnecessaryUnparsed" skipUnnecessaryUnparsed
                            . traced "mergeIdenticalStates" mergeIdenticalStates
                            . traced "mergeConsequtiveStates" mergeConsequtiveStates
@@ -448,16 +449,18 @@ mergeConsequtiveStates :: Machine -> Machine
 mergeConsequtiveStates machine = Map.map merge machine
   where merge state0@(State { sTransitions = [ Transition { tClasses = Nothing, tStateIndex = index1 } ] }) = let Just state1 = Map.lookup index1 machine
                                                                                                               in case (state0|>sAction, state1|>sAction) of
-                                                                                                                      (Nothing,             action ) -> state1
-                                                                                                                      (Just DoneToken,      action ) -> state1
-                                                                                                                      (Just (BeginToken _), _      ) -> state0
-                                                                                                                      (Just (Commit _),     _      ) -> state0
-                                                                                                                      (Just (EmptyToken _), _      ) -> state0
-                                                                                                                      (Just (EndChoice _),  _      ) -> state0
-                                                                                                                      (Just (EndToken _),   _      ) -> state0
-                                                                                                                      (Just Unexpected,     _      ) -> state0
-                                                                                                                      (action,              Nothing) -> state1 { sAction = action }
-                                                                                                                      (_,                   _      ) -> state0
+                                                                                                                      (Nothing,              action ) -> state1
+                                                                                                                      (Just (BeginToken _),  _      ) -> state0
+                                                                                                                      (Just (Commit _),      _      ) -> state0
+                                                                                                                      (Just DoneToken,       action ) -> state1
+                                                                                                                      (Just (EmptyToken _),  _      ) -> state0
+                                                                                                                      (Just (EndChoice _),   _      ) -> state0
+                                                                                                                      (Just (EndToken _),    _      ) -> state0
+                                                                                                                      (Just (EndUnparsed _), _      ) -> state0
+                                                                                                                      (Just PopState,        _      ) -> state0
+                                                                                                                      (Just Unexpected,      _      ) -> state0
+                                                                                                                      (action,               Nothing) -> state1 { sAction = action }
+                                                                                                                      (_,                    _      ) -> state0
         merge state = state
 
 
@@ -499,7 +502,7 @@ removeUnusedStates machine = let usedIndices = collectReachable machine Set.empt
 
 
 data Location = Entry | Exit
-  deriving (Ord, Eq)
+  deriving (Ord, Eq, Show)
 
 
 -- | @dynamic actionFunction mergeFunction initValue machine@ performs dynamic programming to compute values for each @State@.
@@ -523,7 +526,7 @@ dynamic actionFunction mergeFunction initValue machine = dynamicUpdate Map.empty
                                                                         else dynamicUpdate stateData' $ updates ++ map (updateTransition newExitValue) (state|>sTransitions)
         updateTransition value transition = (transition|>tStateIndex, value)
 
-
+{-
 -- | @unendedTokens machine@ computes the set of unended tokens for each state of the /machine/.
 unendedTokens :: Machine -> Map.Map (Location, Int) (Set.Set String)
 
@@ -548,14 +551,16 @@ skipUnnecessaryEndTokens machine = let stateTokens = unendedTokens machine
                                                        then transition { tStateIndex = index }
                                                        else transition
                                                   _ -> transition
-
+-}
 
 -- | @unterminatedTokens machine@ computes for each state of the /machine/ the depth of the unterminated tokens stack when entering the state.
+-- An "Unparsed" token is assumed to be automatically started by the implementation of the state machine.
 unterminatedTokens :: Machine -> Map.Map (Location, Int) Int
 
-unterminatedTokens machine = dynamic actionFunction mergeFunction 0 machine
+unterminatedTokens machine = dynamic actionFunction mergeFunction 1 machine
   where actionFunction depth (Just (BeginToken _)) = depth + 1
         actionFunction depth (Just (EndToken _)) = depth - 1
+        actionFunction depth (Just (EndUnparsed _)) = depth - 1
         actionFunction depth _ = depth
         mergeFunction newDepth oldDepth = max newDepth oldDepth
 
@@ -564,16 +569,26 @@ unterminatedTokens machine = dynamic actionFunction mergeFunction 0 machine
 skipUnnecessaryUnparsed :: Machine -> Machine
 
 skipUnnecessaryUnparsed machine = let stateDepth = unterminatedTokens machine
-                                  in Map.mapWithKey (fixState stateDepth) machine
-  where fixState stateDepth index state = case Map.lookup (Exit, index) stateDepth of
-                                               Nothing -> state
-                                               Just 0  -> state { sTransitions = map fixTransition $ state|>sTransitions }
-                                               _       -> state
-        fixTransition transition = let Just state = Map.lookup (transition|>tStateIndex) machine
-                                   in case state of
-                                           State { sAction = Just (EndToken "Unparsed"), sTransitions = [ Transition { tStateIndex = index, tClasses = Nothing } ] } -> transition { tStateIndex = index }
-                                           State { sAction = Just (EndToken _) } -> error $ "fixTransition: " ++ show state
-                                           _ -> transition
+                                  in foldr (fixState stateDepth) machine $ Map.toList machine
+  where fixState stateDepth (index, state) machine = case Map.lookup (Exit, index) stateDepth of
+                                                          Nothing    -> machine
+                                                          Just depth | depth <= 0 -> Map.insert index (state { sTransitions = map skip $ state|>sTransitions }) machine
+                                                          Just depth | depth > 0  -> let (machine', transition') = mapAccumR (split depth) machine $ state|>sTransitions
+                                                                                     in Map.insert index (state { sTransitions = transition' }) machine'
+
+        skip transition = let Just state = Map.lookup (transition|>tStateIndex) machine
+                              in case state of
+                                      State { sAction = Just (EndToken "Unparsed"), sTransitions = [ Transition { tStateIndex = index, tClasses = Nothing } ] } -> transition { tStateIndex = index }
+                                      State { sAction = Just (EndUnparsed _),       sTransitions = [ Transition { tStateIndex = index, tClasses = Nothing } ] } -> transition { tStateIndex = index }
+                                      _ -> transition
+        split depth machine transition = let Just state = Map.lookup (transition|>tStateIndex) machine
+                                         in case state of
+                                                 State { sAction = Just (EndUnparsed unparsed), sTransitions = [ Transition { tStateIndex = index, tClasses = Nothing } ] } | unparsed /= depth ->
+                                                   newState index
+                                                 State { sAction = Just (EndToken "Unparsed"), sTransitions = [ Transition { tStateIndex = index, tClasses = Nothing } ] } ->
+                                                   newState index
+                                                 _ -> (machine, transition)
+                                         where newState index = (Map.insert (Map.size machine) (actionState (EndUnparsed depth) index) machine, transition { tStateIndex = Map.size machine })
 
 
 -- * Directives.
@@ -638,13 +653,15 @@ actionDirective state (Just (EndChoice name)) = "END_CHOICE(" ++ name ++ ", " ++
 
 actionDirective state (Just (EndToken name)) = "END_TOKEN(" ++ name ++ ", " ++ doneTokenIndex state ++ ")\n"
 
+actionDirective state (Just (EndUnparsed depth)) = "END_TOKEN(Unparsed, " ++ doneTokenIndex state ++ ")\n"
+
 actionDirective _ (Just IncrementCounter) = "INCREMENT_COUNTER\n"
 
 actionDirective _ (Just NextChar) = "NEXT_CHAR\n"
 
 actionDirective _ (Just NextLine) = "NEXT_LINE\n"
 
-actionDirective _ (Just PopState) = "POP_STATE\n"
+actionDirective state (Just PopState) = "POP_STATE(" ++ doneTokenIndex state ++ ")\n"
 
 actionDirective _ (Just PrevChar) = "PREV_CHAR\n"
 
@@ -654,7 +671,7 @@ actionDirective _ (Just ResetCounter) = "RESET_COUNTER\n"
 
 actionDirective _ (Just ResetState) = "RESET_STATE\n"
 
-actionDirective _ (Just SetState) = "SET_STATE\n"
+actionDirective state (Just SetState) = "SET_STATE(" ++ doneTokenIndex state ++ ")\n"
 
 actionDirective state (Just Unexpected) = "UNEXPECTED(" ++ doneTokenIndex state ++ ")\n"
 
