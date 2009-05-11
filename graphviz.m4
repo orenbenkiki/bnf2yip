@@ -17,6 +17,7 @@ divert(-1)
 define(`BEGIN_MACHINE', `
 define(`CURRENT_MACHINE', `$1')
 define(`DONE_STATE', `')
+define(`IS_EVEN', `1')
 divert(-1)dnl
   subgraph "cluster-$1" {
 divert(1)
@@ -59,6 +60,77 @@ divert(1)dnl
 divert(-1)
 ')
 
+define(`BEGIN_CLUSTER', `
+define(`CURRENT_CLUSTER', `$1')
+divert(1)dnl
+    subgraph "cluster$1" {
+        label = "";
+        style = "setlinewidth(0), filled";
+divert(-1)
+ifelse(IS_EVEN, `1', `
+define(`IS_EVEN', `0')
+divert(1)dnl
+        bgcolor = "EVEN_COLOR";
+divert(-1)
+', `
+define(`IS_EVEN', `1')
+divert(1)dnl
+        bgcolor = "ODD_COLOR";
+divert(-1)
+')
+')
+
+define(`BEGIN_CLUSTER_ENTRY', `
+divert(1)dnl
+    subgraph "cluster`'CURRENT_CLUSTER`'entry" {
+        style = invis;
+        rank = source;
+divert(-1)
+')
+
+define(`END_CLUSTER_ENTRY', `
+divert(1)dnl
+    }
+divert(-1)
+')
+
+define(`BEGIN_CLUSTER_EXIT', `
+divert(1)dnl
+    subgraph "cluster`'CURRENT_CLUSTER`'exit" {
+        style = invis;
+        rank = sink;
+divert(-1)
+')
+
+define(`END_CLUSTER_EXIT', `
+divert(1)dnl
+    }
+divert(-1)
+')
+
+define(`CLUSTER_NODE', `
+divert(1)dnl
+        "CURRENT_MACHINE-$1";
+divert(-1)
+')
+
+define(`CLUSTER_TRANSITION', `
+divert(1)dnl
+        "CURRENT_MACHINE-$1-$2";
+divert(-1)
+')
+
+define(`END_CLUSTER', `
+ifelse(IS_EVEN, `1', `
+define(`IS_EVEN', `0')
+', `
+define(`IS_EVEN', `1')
+')
+divert(1)dnl
+    }
+divert(-1)
+')
+
 define(`BEGIN_STATE', `
 define(`CURRENT_STATE', `$1')
 divert(1)dnl
@@ -66,7 +138,9 @@ divert(1)dnl
 divert(-1)
 ')
 
-define(`NOP_COLOR', `#DFDFDF')
+define(`EVEN_COLOR', `#EEEEEE')
+define(`ODD_COLOR', `#DDDDDD')
+define(`NOP_COLOR', `#CCCCCC')
 define(`FAILURE_COLOR', `#FF9999')
 define(`TOKEN_COLOR', `#99FF99')
 define(`CHOICE_COLOR', `#9999FF')

@@ -418,8 +418,10 @@ optimize :: Machine -> Machine
 optimize machine = traced "removeUnusedStates" removeUnusedStates
                  $ traced "loopDone" loopDone
                  $ fixpoint (traced "removeUnusedStates" removeUnusedStates
-                           -- . traced "skipUnnecessaryEndTokens" skipUnnecessaryEndTokens
+                           {- Not necessary since the machine is kept clean (with blood, sweat and tears).
+                           . traced "skipUnnecessaryEndTokens" skipUnnecessaryEndTokens
                            . traced "skipUnnecessaryUnparsed" skipUnnecessaryUnparsed
+                           -}
                            . traced "mergeIdenticalStates" mergeIdenticalStates
                            . traced "mergeConsequtiveStates" mergeConsequtiveStates
                            . traced "mergeSuccessFailure" mergeSuccessFailure) machine
@@ -511,31 +513,32 @@ data Location = Entry | Exit
 -- Since the same @State@ may be reached through multiple paths, the /mergeFunction/ merges a new entry value with an old one.
 -- The process repeats until no @State@s change their exit values.
 -- The final result is the entry and exit values for each @State@.
-dynamic :: (Eq a) => (a -> Maybe Action -> a) -> (a -> a -> a) -> a -> Machine -> Map.Map (Location, Int) a
+dynamic :: (Show a, Eq a) => (Int -> a -> Maybe Action -> a) -> (Int -> a -> a -> a) -> a -> Machine -> Map.Map (Int, Location) a
 
 dynamic actionFunction mergeFunction initValue machine = dynamicUpdate Map.empty [ (0, initValue) ]
   where dynamicUpdate stateData [] = stateData
-        dynamicUpdate stateData ((index, entryValue) : updates) = let newEntryValue = case Map.lookup (Entry, index) stateData of
-                                                                                           Just oldEntryValue -> mergeFunction entryValue oldEntryValue
+        dynamicUpdate stateData ((index, entryValue) : updates) = let newEntryValue = case Map.lookup (index, Entry) stateData of
+                                                                                           Just oldEntryValue -> trace ("Data: " ++ show stateData) $ mergeFunction index entryValue oldEntryValue
                                                                                            Nothing            -> entryValue
                                                                       Just state = Map.lookup index machine
-                                                                      newExitValue = actionFunction newEntryValue $ state|>sAction
-                                                                      stateData' = insertList [ ((Entry, index), newEntryValue), ((Exit, index), newExitValue) ] stateData
-                                                                  in if Just newExitValue == Map.lookup (Exit, index) stateData
+                                                                      newExitValue = actionFunction index newEntryValue $ state|>sAction
+                                                                      stateData' = insertList [ ((index, Entry), newEntryValue), ((index, Exit), newExitValue) ] stateData
+                                                                  in if Just newExitValue == Map.lookup (index, Exit) stateData
                                                                         then dynamicUpdate stateData' updates
                                                                         else dynamicUpdate stateData' $ updates ++ map (updateTransition newExitValue) (state|>sTransitions)
         updateTransition value transition = (transition|>tStateIndex, value)
 
 {-
+
 -- | @unendedTokens machine@ computes the set of unended tokens for each state of the /machine/.
-unendedTokens :: Machine -> Map.Map (Location, Int) (Set.Set String)
+unendedTokens :: Machine -> Map.Map (Int, Location) (Set.Set String)
 
 unendedTokens machine = dynamic actionFunction mergeFunction Set.empty machine
-  where actionFunction tokens (Just (EmptyToken name))
+  where mergeFunction _ newTokens oldTokens = Set.union newTokens oldTokens
+        actionFunction _ tokens (Just (EmptyToken name))
           | "Begin" `isPrefixOf` name = Set.insert (drop 5 name) tokens
           | "End" `isPrefixOf` name = Set.delete (drop 3 name) tokens
-        actionFunction tokens _ = tokens
-        mergeFunction newTokens oldTokens = Set.union newTokens oldTokens
+        actionFunction _ tokens _ = tokens
 
 
 -- | @skipUnnecessaryEndTokens machine@ skips all the unnecessary @EndToken@ states in /machine/.
@@ -543,7 +546,7 @@ skipUnnecessaryEndTokens :: Machine -> Machine
 
 skipUnnecessaryEndTokens machine = let stateTokens = unendedTokens machine
                                    in Map.mapWithKey (fixState stateTokens) machine
-  where fixState stateTokens index state = state { sTransitions = map (fixTransition $ Map.findWithDefault Set.empty (Exit, index) stateTokens) $ state|>sTransitions }
+  where fixState stateTokens index state = state { sTransitions = map (fixTransition $ Map.findWithDefault Set.empty (index, Exit) stateTokens) $ state|>sTransitions }
         fixTransition tokens transition = let Just state = Map.lookup (transition|>tStateIndex) machine
                                           in case state of
                                                   State { sAction = Just (EmptyToken name), sTransitions = [ Transition { tStateIndex = index, tClasses = Nothing } ] } ->
@@ -551,18 +554,18 @@ skipUnnecessaryEndTokens machine = let stateTokens = unendedTokens machine
                                                        then transition { tStateIndex = index }
                                                        else transition
                                                   _ -> transition
--}
+
 
 -- | @unterminatedTokens machine@ computes for each state of the /machine/ the depth of the unterminated tokens stack when entering the state.
 -- An "Unparsed" token is assumed to be automatically started by the implementation of the state machine.
-unterminatedTokens :: Machine -> Map.Map (Location, Int) Int
+unterminatedTokens :: Machine -> Map.Map (Int, Location) Int
 
 unterminatedTokens machine = dynamic actionFunction mergeFunction 1 machine
-  where actionFunction depth (Just (BeginToken _)) = depth + 1
-        actionFunction depth (Just (EndToken _)) = depth - 1
-        actionFunction depth (Just (EndUnparsed _)) = depth - 1
-        actionFunction depth _ = depth
-        mergeFunction newDepth oldDepth = max newDepth oldDepth
+  where mergeFunction _ newDepth oldDepth = max newDepth oldDepth
+        actionFunction _ depth (Just (BeginToken _)) = depth + 1
+        actionFunction _ depth (Just (EndToken _)) = depth - 1
+        actionFunction _ depth (Just (EndUnparsed _)) = depth - 1
+        actionFunction _ depth _ = depth
 
 
 -- | @skipUnnecessaryUnparsed machine@ skips all the unnecessary @Unparsed@ states in /machine/.
@@ -570,7 +573,7 @@ skipUnnecessaryUnparsed :: Machine -> Machine
 
 skipUnnecessaryUnparsed machine = let stateDepth = unterminatedTokens machine
                                   in foldr (fixState stateDepth) machine $ Map.toList machine
-  where fixState stateDepth (index, state) machine = case Map.lookup (Exit, index) stateDepth of
+  where fixState stateDepth (index, state) machine = case Map.lookup (index, Exit) stateDepth of
                                                           Nothing    -> machine
                                                           Just depth | depth <= 0 -> Map.insert index (state { sTransitions = map skip $ state|>sTransitions }) machine
                                                           Just depth | depth > 0  -> let (machine', transition') = mapAccumR (split depth) machine $ state|>sTransitions
@@ -589,6 +592,125 @@ skipUnnecessaryUnparsed machine = let stateDepth = unterminatedTokens machine
                                                    newState index
                                                  _ -> (machine, transition)
                                          where newState index = (Map.insert (Map.size machine) (actionState (EndUnparsed depth) index) machine, transition { tStateIndex = Map.size machine })
+-}
+
+-- * Clustering.
+
+
+-- | The machine starts with an implicit "Unparsed" token represented by the -1 fake state index cluster.
+startCluster = Set.singleton (-1)
+
+-- | For clarity, wrapping up the implicit "Unparsed" token is done in a separate cluster with the fake index state -2.
+finishCluster = Set.singleton (-2)
+
+
+-- | @clusterName set@ converts the /set/ of state indices to a cluster name.
+clusterName :: Set.Set Int -> String
+
+clusterName set = foldr1 combine $ map show $ Set.toAscList set
+  where combine left right = left ++ "+" ++ right
+
+-- | @stateClusters machine@ computes for each @State@ in the /machine/ the nested clusters it belongs to.
+stateClusters :: Machine -> Map.Map (Int, Location) [ Set.Set Int ]
+
+stateClusters machine = dynamic actionFunction mergeFunction [ startCluster ] machine
+  where mergeFunction _ newClusters oldClusters | tail newClusters == tail oldClusters = Set.union (head oldClusters) (head newClusters) : tail oldClusters
+        mergeFunction index newClusters oldClusters = error $ "Index: " ++ show index ++ "\nNew: " ++ show newClusters ++ "\nOld: " ++ show oldClusters
+        actionFunction index clusters (Just (BeginToken _)) = Set.singleton index : clusters
+        actionFunction index [ cluster ] (Just (EndToken _)) | cluster == startCluster = [ finishCluster, startCluster ]
+        actionFunction index (head : clusters) (Just (EndToken _)) = clusters
+        actionFunction index [ cluster ] (Just (EndUnparsed _)) | cluster == startCluster = [ finishCluster, startCluster ]
+        actionFunction index (head : clusters) (Just (EndUnparsed _)) = clusters
+        actionFunction index clusters (Just PushState) = Set.singleton index : clusters
+        actionFunction index [ cluster ] (Just PopState) | cluster == startCluster = [ finishCluster, startCluster ]
+        actionFunction index (head : clusters) (Just PopState) = clusters
+        actionFunction index clusters (Just (EmptyToken name)) | "Begin" `isPrefixOf` name = Set.singleton index : clusters
+        actionFunction index (head : clusters) (Just (EmptyToken name)) | "End" `isPrefixOf` name = clusters
+        actionFunction _ clusters _ = clusters
+
+
+-- | Represent the overall structure of the state machine as a nested @Tree@ of clusters.
+data Tree = Tree String [ Tree ]
+  deriving (Show)
+
+
+-- | @clusterTree sets@ converts the cluster /sets/ of all the @State@s of a @Machine@ into a @Tree@.
+clusterTree :: [ [ Set.Set Int ] ] -> Tree
+
+clusterTree stacks = foldr1 mergeTrees $ map (stackTree .reverse) stacks
+  where stackTree [ leaf ] = Tree (clusterName leaf) []
+        stackTree (head : tail) = Tree (clusterName head) [ stackTree tail ]
+        mergeTrees (Tree parent1 nested1) (Tree parent2 nested2) | parent1 == parent2 = Tree parent1 $ mergeNested nested1 nested2
+        mergeNested [] nested = nested
+        mergeNested nested [] = nested
+        mergeNested nested1@(head1@(Tree set1 _) : tail1) nested2@(head2@(Tree set2 _) : tail2)
+          | set1 == set2 = mergeTrees head1 head2 : mergeNested tail1 tail2
+          | set1 < set2 = head1 : mergeNested tail1 nested2
+          | set1 > set2 = head2 : mergeNested nested1 tail2
+
+
+-- | @innerStates clusters@ converts the /clusters/ of each @State@ into a mapping from cluster name to the list of inner nodes belonging to it.
+innerStates :: Map.Map (Int, Location) [ Set.Set Int ] -> Map.Map String [ Int ]
+
+innerStates clusters = Map.fromListWith (++) $ mapMaybe cluster [0 .. (Map.size clusters `div` 2) - 1]
+  where cluster index = let entries = fromJust $ Map.lookup (index, Entry) clusters
+                            exits = fromJust $ Map.lookup (index, Exit) clusters
+                        in if entries == exits
+                              then Just (clusterName $ head entries, [ index ])
+                              else Nothing
+
+
+-- | @entryStates clusters@ converts the /clusters/ of each @State@ into a mapping from cluster name to the list of entry nodes belonging to it.
+entryStates :: Map.Map (Int, Location) [ Set.Set Int ] -> Map.Map String [ Int ]
+
+entryStates clusters = Map.fromListWith (++) $ mapMaybe cluster [0 .. (Map.size clusters `div` 2) - 1]
+  where cluster index = let entries = fromJust $ Map.lookup (index, Entry) clusters
+                            exits = fromJust $ Map.lookup (index, Exit) clusters
+                        in if entries /= exits && entries `isSuffixOf` exits
+                              then Just (clusterName $ head exits, [ index ])
+                              else Nothing
+
+
+-- | @exitStates clusters@ converts the /clusters/ of each @State@ into a mapping from cluster name to the list of exit nodes belonging to it.
+exitStates :: Map.Map (Int, Location) [ Set.Set Int ] -> Map.Map String [ Int ]
+
+exitStates clusters = Map.fromListWith (++) $ mapMaybe cluster [0 .. (Map.size clusters `div` 2) - 1]
+  where cluster index = let entries = fromJust $ Map.lookup (index, Entry) clusters
+                            exits = fromJust $ Map.lookup (index, Exit) clusters
+                        in if entries /= exits && exits `isSuffixOf` entries
+                              then Just (clusterName $ head entries, [ index ])
+                              else Nothing
+
+
+-- | @clusterDirectives machine entry inner exit tree@ returns cluster directives for the /machine/,
+-- given the /entry/, /inner/ and /exit/ nodes for each cluster mentioned in the /tree/.
+-- Cluster directives are used solely to structure the graphical presentation of the /machine/.
+clusterDirectives :: Machine -> Map.Map String [ Int ] -> Map.Map String [ Int ] -> Map.Map String [ Int ] -> Tree -> String
+
+clusterDirectives machine entry inner exit (Tree set nested) = "BEGIN_CLUSTER(" ++ set ++ ")\n"
+                                                              ++ (case Map.lookup set entry of
+                                                                       Nothing -> "NO_CLUSTER_ENTRY\n"
+                                                                       Just states -> "BEGIN_CLUSTER_ENTRY\n"
+                                                                                   ++ (foldr (++) "" $ map stateDirective states)
+                                                                                   ++ "END_CLUSTER_ENTRY\n")
+                                                              ++ (case Map.lookup set inner of
+                                                                       Nothing -> "NO_CLUSTER_INNER\n"
+                                                                       Just states -> "BEGIN_CLUSTER_INNER\n"
+                                                                                   ++ (foldr (++) "" $ map stateDirective states)
+                                                                                   ++ "END_CLUSTER_INNER\n")
+                                                              ++ (case Map.lookup set exit of
+                                                                       Nothing -> "NO_CLUSTER_EXIT\n"
+                                                                       Just states -> "BEGIN_CLUSTER_EXIT\n"
+                                                                                   ++ (foldr (++) "" $ map stateDirective states)
+                                                                                   ++ "END_CLUSTER_EXIT\n")
+                                                              ++ foldr (++) "" (map (clusterDirectives machine entry inner exit) nested)
+                                                              ++ "END_CLUSTER(" ++ set ++ ")\n"
+                                                                 where stateDirective index = let state = fromJust $ Map.lookup index machine
+                                                                                                  nodeDirective = "CLUSTER_NODE(" ++ show index ++ ")\n"
+                                                                                                  transitionDirectives = mapMaybe (transitionDirective index) $ zip [0..] $ state|>sTransitions
+                                                                                              in foldr (++) nodeDirective transitionDirectives
+                                                                       transitionDirective stateIndex (_, Transition { tClasses = Nothing }) = Nothing
+                                                                       transitionDirective stateIndex (index, _) = Just $ "CLUSTER_TRANSITION(" ++ show stateIndex ++ ", " ++ show index ++ ")\n"
 
 
 -- * Directives.
@@ -605,10 +727,22 @@ namedDirectives :: Named -> String
 
 namedDirectives named = "BEGIN_MACHINE(" ++ (named|>nIndex) ++ ", " ++ spoilName (named|>nName) ++ ", `" ++ (named|>nName) ++ "')\n"
                      ++ listDirectives "PARAMETERS" (map parameterDirective $ named|>nParameters)
+                     ++ (trace ("Clusters: " ++ show clusters) "")
+                     ++ (trace ("Tree: " ++ show tree) "")
+                     ++ (trace ("Inner: " ++ show inner) "")
+                     ++ (trace ("Entry: " ++ show entry) "")
+                     ++ "BEGIN_CLUSTERS\n"
+                     ++ clusterDirectives (named|>nMachine) entry inner exit tree
+                     ++ "END_CLUSTERS\n"
                      ++ "BEGIN_STATES(" ++ (show $ Map.size $ named|>nMachine) ++ ")\n"
                      ++ (concatMap stateDirectives $ Map.toAscList $ named|>nMachine)
                      ++ "END_STATES(" ++ (show $ Map.size $ named|>nMachine) ++ ")\n"
                      ++ "END_MACHINE(" ++ (named|>nIndex) ++ ", " ++ spoilName (named|>nName) ++ ",  `" ++ (named|>nName) ++ "')\n"
+                        where clusters = stateClusters $ named|>nMachine
+                              tree = clusterTree $ Map.elems clusters
+                              inner = innerStates clusters
+                              entry = entryStates clusters
+                              exit = exitStates clusters
 
 
 -- | @parameterDirective name@ converts the parameter /name/ to a directive.
@@ -674,6 +808,8 @@ actionDirective _ (Just ResetState) = "RESET_STATE\n"
 actionDirective state (Just SetState) = "SET_STATE(" ++ doneTokenIndex state ++ ")\n"
 
 actionDirective state (Just Unexpected) = "UNEXPECTED(" ++ doneTokenIndex state ++ ")\n"
+
+actionDirective state action = error $ "actionDirective: " ++ show action
 
 
 -- | @doneTokenIndex state@ returns the index of the @State@ that immediatly follows the current /state/.

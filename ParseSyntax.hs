@@ -39,7 +39,7 @@ parseSyntax text = parsedToSyntax $ parseModule text
 
 
 -- | @parsedToSyntax parsed@ converts the /parsed/ Haskell code of the BNF into a @Syntax@ object we can work with.
-parsedToSyntax (ParseOk (HsModule _ _ _ _ productions)) = let syntax = take 73 $ catMaybes $ map parsedToProduction productions
+parsedToSyntax (ParseOk (HsModule _ _ _ _ productions)) = let syntax = take 78 $ catMaybes $ map parsedToProduction productions
                                                               index = map fst syntax
                                                           in (Map.fromList syntax, index)
 

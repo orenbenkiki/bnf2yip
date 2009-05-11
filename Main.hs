@@ -130,8 +130,7 @@ main = do args <- getArgs
 -- | @prepare syntax@ performs all the one-time preparations of the parsed /syntax/ before optimization.
 prepare :: Syntax -> Syntax
 
-prepare syntax = (traced "wrapProduction" $ Map.map wrapProduction)
-               $ (mapSyntax $ traced "purgePeeks" purgePeeks)
+prepare syntax = (mapSyntax $ traced "purgePeeks" purgePeeks)
                $ (traced "filter" $ Map.filter (notElem BadContext . listNode . snd))
                $ (\syntax -> (mapSyntax $ traced "inline" (inline syntax Set.empty)) syntax)
                $ (traced "decontext" $ Map.fromList . concatMap decontext . Map.toList)
@@ -180,7 +179,7 @@ simplify StartOfLine = Chars $ CharSet.fake $ CharSet.startOfLine
 
 simplify node@(Symbol _) = node
 
-simplify (Token name pattern) = And [ BeginToken name, pattern, EndToken name, PrefixError $ EndToken "Unparsed" ]
+simplify (Token name pattern) = PrefixError (And [ BeginToken name, pattern, EndToken name ]) (EndToken "Unparsed")
 
 simplify node@(UptoN _ _) = node
 
@@ -188,7 +187,7 @@ simplify node@(Value _) = node
 
 simplify node@(Variable _) = node
 
-simplify (WrapTokens beginToken endToken pattern) = And [ EmptyToken beginToken, pattern, EmptyToken endToken, PrefixError $ EmptyToken endToken ]
+simplify (WrapTokens beginToken endToken pattern) = And [ EmptyToken beginToken, PrefixError (And [ pattern, EmptyToken endToken ]) (EmptyToken endToken) ]
 
 simplify node@(ZeroOrMore _) = node
 
@@ -242,6 +241,8 @@ contextify name context = name ++ " " ++ context
 inline :: Syntax -> Set.Set String -> Node -> Node
 
 inline syntax callers node@(Call name parameters)
+  | foldr (||) False $ map isLiteralContext parameters = let (context, parameters') = foldr extractContext ("", []) parameters
+                                                         in inline syntax callers $ Call (contextify name context) parameters'
   | foldr (||) False $ map isComplex parameters = error $ "inline: " ++ show node
   | Set.member name callers = node
   | Map.lookup name syntax == Nothing = BadContext
@@ -253,8 +254,12 @@ inline syntax callers node@(Call name parameters)
                         Nothing -> pattern'
   where isComplex (Variable _) = False
         isComplex _ = True
+        isLiteralContext (Symbol _) = True
+        isLiteralContext _ = False
         isRecursiveCall (Call name' _) = name' == name
         isRecursiveCall _ = False
+        extractContext (Symbol context) (_, parameters) = (context, parameters)
+        extractContext parameter (context, parameters) = (context, parameter : parameters)
 
 inline syntax callers node = node
 
@@ -293,7 +298,7 @@ purgePeeks node@(Or _) = node
 
 purgePeeks node@(Plus _ _) = node
 
-purgePeeks node@(PrefixError _) = node
+purgePeeks node@(PrefixError _ _) = node
 
 purgePeeks node@(RepeatN _ _) = node
 
@@ -321,7 +326,7 @@ purgePeekActions node@(Chars _) = node
 
 purgePeekActions node@(EndToken _) = Empty
 
-purgePeekActions node@(PrefixError _) = node
+purgePeekActions (PrefixError pattern _) = pattern
 
 purgePeekActions node@NextChar = node
 
@@ -335,12 +340,10 @@ purgePeekActions node = error $ "purgePeekActions: " ++ show node
 -- An "Unparsed" token is assumed to be automatically started by the implementation of the state machine.
 wrapProduction :: Production -> Production
 
-wrapProduction (parameters, pattern) = (parameters, And [ pattern,
-                                                          PrefixError (EndToken "Unparsed"),
-                                                          EndToken "Unparsed",
-                                                          Chars $ CharSet.fake $ CharSet.endOfFile,
-                                                          PrefixError $ And [ Unexpected, EmptyToken "Done" ],
-                                                          EmptyToken "Done" ])
+wrapProduction (parameters, pattern) = (parameters, PrefixError (And [ And [ PrefixError (And [ pattern, EndToken "Unparsed" ]) (EndToken "Unparsed") ],
+                                                                       Chars $ CharSet.fake $ CharSet.endOfFile,
+                                                                       EmptyToken "Done" ])
+                                                                (And [ Unexpected, EmptyToken "Done" ]))
 
 
 -- * Optimize.
@@ -352,11 +355,13 @@ optimize :: Syntax -> Syntax
 optimize syntax = fixpoint (mapSyntax (traced "collapseLists" collapseLists)
                           . mapSyntax (traced "computeAndNots" computeAndNots)
                           . mapSyntax (traced "distinctOrChars" distinctOrChars)
+                          . mapSyntax (traced "extractPrefixErrorChars" extractPrefixErrorChars)
                           . mapSyntax (traced "flattenAnds" flattenAnds)
                           . mapSyntax (traced "flattenOrs" flattenOrs)
                           . mapSyntax (traced "mergeOrChars" mergeOrChars)
                           . mapSyntax (traced "mergeOrHeads" mergeOrHeads)
                           . mapSyntax (traced "mergeOrLoops" mergeOrLoops)
+                          . mapSyntax (traced "mergeOrPrefixErrors" mergeOrPrefixErrors)
                           . mapSyntax (traced "removeAndEmpties" removeAndEmpties)
                           . mapSyntax (traced "removeSimpleChoices" removeSimpleChoices)
                           . mapSyntax (traced "reorderAndLists" reorderAndLists)
@@ -409,6 +414,14 @@ computeAndNots (AndNot (And (Chars baseChars : baseTail)) (And (Chars subtract :
 computeAndNots node = node
 
 
+-- | @extractPrefixErrorChars node@ extracts a @Chars@ node from inside the @PrefixError@ /node/, if possible.
+extractPrefixErrorChars :: Node -> Node
+
+extractPrefixErrorChars (PrefixError (And (chars@(Chars _) : pattern)) prefix) = And [ chars, PrefixError (And pattern) prefix ]
+
+extractPrefixErrorChars node = node
+
+
 -- | @flattenAnds node@ flattens and @And@ of @And@ /node/ to a single @Node@.
 flattenAnds :: Node -> Node
 
@@ -434,7 +447,7 @@ mergeOrChars :: Node -> Node
 
 mergeOrChars (Or nodes) = Or $ foldr merge [] nodes
   where merge node [] = [ node ]
-        -- Q merge (Chars first) (Chars second : nodes) = (Chars $ CharSet.union first second) : nodes
+        merge (Chars _) [ Empty ] = [ Empty ]
         merge (And (Chars firstChars : firstTail)) (And (Chars secondChars : secondTail) : rest)
           | firstTail == secondTail = And (Chars (CharSet.union firstChars secondChars) : firstTail) : rest
         merge node nodes = node : nodes
@@ -459,6 +472,26 @@ mergeOrHeads node = node
 -- | @mergeOrLoops node@ merges loop head elements of an @Or@ /node/ sub-nodes lists.
 mergeOrLoops :: Node -> Node
 
+-- Horribly specific special case... but it works.
+mergeOrLoops (Or [ And [ PrefixError
+                           (And [ BeginToken "Indent", RepeatN (Variable "n") (And [ Chars space1, NextChar ]), EndToken "Indent" ])
+                           (EndToken "Unparsed"),
+                         Or [ And [ Chars white1,
+                                   PrefixError (And [ BeginToken "White", NextChar, ZeroOrMore (And [ Chars white2, NextChar ]), EndToken "White" ])
+                                               (EndToken "Unparsed") ],
+                             Empty ] ],
+                   PrefixError (And [ BeginToken "Indent", UptoN (Variable "n") (And [ Chars space2, NextChar ]), EndToken "Indent" ])
+                               (EndToken "Unparsed") ]) = And [ BeginToken "Indent",
+                                                                PrefixError (LoopN (Variable "n")
+                                                                                   (And [ Chars space1, NextChar ])
+                                                                                   (EndToken "Indent")
+                                                                                   (And [ EndToken "Indent",
+                                                                                           BeginToken "White",
+                                                                                           ZeroOrMore (And [ Chars white1, NextChar ]),
+                                                                                           EndToken "White" ]))
+                                                                            (EndToken "Unparsed") ]
+
+
 mergeOrLoops (Or nodes) = Or $ foldr merge [] nodes
   where merge node [] = [ node ]
         merge (And (RepeatN repeatTimes repeatPattern : repeatTail)) (And (UptoN uptoTimes uptoPattern : uptoTail) : rest)
@@ -466,6 +499,19 @@ mergeOrLoops (Or nodes) = Or $ foldr merge [] nodes
         merge node nodes = node : nodes
 
 mergeOrLoops node = node
+
+-- | @mergeOrPrefixErrors node@ merges consequtive @PrefixError@ sub-nodes of an @Or@ /node/, if possible.
+mergeOrPrefixErrors :: Node -> Node
+
+mergeOrPrefixErrors (Or nodes) = Or $ foldr merge [] nodes
+  where merge (PrefixError (And (chars@(Chars _) : pattern)) prefix) nodes = And [ chars, PrefixError (And pattern) prefix ] : nodes
+        merge (And ((PrefixError (And (chars@(Chars _) : pattern)) prefix) : tail)) nodes = And (chars : PrefixError (And pattern) prefix : tail) : nodes
+        merge (PrefixError firstPattern firstPrefix) (PrefixError secondPattern secondPrefix : rest)
+          | firstPrefix == secondPrefix = PrefixError (Or [ firstPattern, secondPattern ]) firstPrefix : rest
+        merge node nodes = node : nodes
+
+mergeOrPrefixErrors node = node
+
 
 -- | @removeAndEmpties node@ removes @Empty@ nodes from and @And@ /node/ sub-nodes list.
 removeAndEmpties :: Node -> Node
@@ -549,9 +595,9 @@ shouldFlip (Or nodes) node = foldr (&&) True $ map ((flip shouldFlip) node) node
 
 shouldFlip node (Or nodes) = foldr (&&) True $ map (shouldFlip node) nodes
 
-shouldFlip (PrefixError pattern) node = shouldFlip pattern node
+shouldFlip (PrefixError pattern prefix) node = shouldFlip pattern node && shouldFlip prefix node
 
-shouldFlip node (PrefixError pattern) = shouldFlip node pattern
+shouldFlip node (PrefixError pattern prefix) = shouldFlip node pattern && shouldFlip node prefix
 
 shouldFlip (RepeatN _ pattern) node = shouldFlip pattern node
 
@@ -615,9 +661,9 @@ keepOrder _ _ = False
 -- If it returns @Nothing@, try reversing the order (and the result).
 switchOrder :: Node -> Node -> Maybe Bool
 
-switchOrder (Chars chars) (BeginToken _) = Just $ chars == CharSet.fake CharSet.endOfFile
+switchOrder (Chars chars) (BeginToken _) = Just False
 
-switchOrder (Chars chars) (EmptyToken _) = Just $ chars == CharSet.fake CharSet.endOfFile
+switchOrder (Chars _) (EmptyToken _) = Just False
 
 switchOrder (Chars _) (EndToken _) = Just True
 
@@ -642,8 +688,9 @@ switchOrder _ _ = Nothing
 -- | @finalize index syntax@ performs final one-time processing on the /syntax/ using its /index/ before converting it to directives.
 finalize :: [ String ] -> Syntax -> ([ CharSet.CharSet ], [ Machine.Named ])
 
-finalize index syntax = let distinct = distinctSets syntax
-                        in (distinct, machinize index $ selectify $ classify distinct syntax)
+finalize index syntax = let wrapped = (traced "wrapProduction" $ Map.map wrapProduction) syntax
+                            distinct = distinctSets $ (traced "wrapProduction" $ Map.map wrapProduction) wrapped
+                        in (distinct, machinize index $ selectify $ classify distinct wrapped)
 
 
 -- ** Classify.
@@ -687,15 +734,12 @@ selectify syntax = mapSyntax (traced "selectifyNode" selectifyNode) syntax
 selectifyNode :: Node -> Node
 
 selectifyNode (Or nodes) = collapseLists $ Or $ foldr merge [] nodes
-  where merge (Classes classes) [] = [ Select [ (Just classes, Empty) ] ]
-        merge Empty [] = [ Select [ (Nothing, Empty) ] ]
-        merge node [] = [ node ]
-        merge (Classes classes) nodes = nodes
-        merge (And (Classes firstClasses : firstTail)) (And (Classes secondClasses : secondTail) : rest) =
-          Select [ (Just firstClasses, collapseLists $ And firstTail), (Just secondClasses, collapseLists $ And secondTail) ] : rest
-        merge (And (Classes classes : tail)) (Select alternatives : rest) = (Select $ (Just classes, collapseLists $ And tail) : alternatives) : rest
-        merge (And (Classes classes : tail)) nodes = [ Select [ (Just classes, collapseLists $ And tail), (Nothing, collapseLists $ Or nodes) ] ]
+  where merge Empty [] = [ Select [ (Nothing, Empty) ] ]
+        merge (Classes classes) nodes = merge (Select [ (Just classes, Empty) ]) nodes
+        merge (And (Classes classes : tail)) nodes = merge (Select [ (Just classes, collapseLists $ And tail) ]) nodes
+        merge (Select firstAlternatives) (Select secondAlternatives : rest) = merge (Select $ firstAlternatives ++ secondAlternatives) rest
         merge node nodes = node : nodes
+        addTail tail (classes, pattern) = (classes, flattenAnds $ And $ pattern : tail)
 
 selectifyNode node = node
 
@@ -723,8 +767,7 @@ machinize index syntax = concatMap (productionMachines syntax) $ zip [1..] index
 nodeMachine :: Node -> Machine.Machine
 
 nodeMachine (And nodes) = foldl merge Machine.empty nodes
-  where merge machine (PrefixError pattern) = Machine.prefixFailure machine $ traced "nodeMachine" nodeMachine pattern
-        merge machine node = Machine.sequential [ machine, traced "nodeMachine" nodeMachine node ]
+  where merge machine node = Machine.sequential [ machine, traced "nodeMachine" nodeMachine node ]
 
 nodeMachine (BeginToken name) = Machine.beginToken name
 
@@ -747,6 +790,8 @@ nodeMachine NextChar = Machine.nextChar
 nodeMachine NextLine = Machine.nextLine
 
 nodeMachine (Or nodes) = Machine.alternatives $ map (traced "nodeMachine" nodeMachine) nodes
+
+nodeMachine (PrefixError pattern prefix) = Machine.prefixFailure (traced "nodeMachine" nodeMachine pattern) (traced "nodeMachine" nodeMachine prefix)
 
 nodeMachine (RepeatN (Variable "n") pattern@(And [ Classes classes, NextChar ])) = Machine.repeatN classes
 

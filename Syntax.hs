@@ -56,7 +56,7 @@ data Node = And [ Node ]
           | Or [ Node ]
           | Peek Node
           | Plus Node Node
-          | PrefixError Node
+          | PrefixError Node Node
           | Prev Node
           | Reject Node
           | RepeatN Node Node
@@ -125,7 +125,7 @@ mapNode function (Peek pattern) = function $ Peek $ mapNode function pattern
 
 mapNode function (Plus left right) = function $ Plus (mapNode function left) (mapNode function right)
 
-mapNode function (PrefixError pattern) = function $ PrefixError (mapNode function pattern)
+mapNode function (PrefixError pattern prefix) = function $ PrefixError (mapNode function pattern) (mapNode function prefix)
 
 mapNode function (Prev pattern) = function $ Prev $ mapNode function pattern
 
@@ -202,7 +202,7 @@ listNode node@(Peek pattern) = node : listNode pattern
 
 listNode node@(Plus left right) = node : listNode left ++ listNode right
 
-listNode node@(PrefixError pattern) = node : listNode pattern
+listNode node@(PrefixError pattern prefix) = node : listNode pattern ++ listNode prefix
 
 listNode node@(Prev pattern) = node : listNode pattern
 
