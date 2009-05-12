@@ -314,6 +314,13 @@ divert(-1)
 define(`LABEL_PREFIX', ` | ')
 ')
 
+define(`IS_SAME_STATE', `
+divert(1)dnl
+LABEL_PREFIX`'IsSameState`'dnl
+divert(-1)
+define(`LABEL_PREFIX', ` | ')
+')
+
 define(`START_OF_LINE', `
 divert(1)dnl
 LABEL_PREFIX`'StartOfLine`'dnl

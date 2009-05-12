@@ -39,7 +39,7 @@ parseSyntax text = parsedToSyntax $ parseModule text
 
 
 -- | @parsedToSyntax parsed@ converts the /parsed/ Haskell code of the BNF into a @Syntax@ object we can work with.
-parsedToSyntax (ParseOk (HsModule _ _ _ _ productions)) = let syntax = take 78 $ catMaybes $ map parsedToProduction productions
+parsedToSyntax (ParseOk (HsModule _ _ _ _ productions)) = let syntax = take 81 $ catMaybes $ map parsedToProduction productions
                                                               index = map fst syntax
                                                           in (Map.fromList syntax, index)
 
@@ -84,7 +84,7 @@ patternToSyntax (HsVar (UnQual (HsIdent name))) = case name of
                                                        "eof"       -> EndOfFile
                                                        _           -> Call (fixName name) []
 
-patternToSyntax (HsCon (UnQual (HsIdent name))) = Results [ Symbol $ fixContext name ]
+patternToSyntax (HsCon (UnQual (HsIdent name))) = Results [ Symbol $ fixContext "1" name ]
 
 patternToSyntax (HsApp (HsVar (UnQual (HsIdent "result"))) (HsTuple expressions)) = Results $ map expressionToSyntax expressions
 
@@ -139,12 +139,9 @@ patternToSyntax unmatched = error $ "Pattern: " ++ show unmatched
 
 
 -- | @alternativeToSyntax parsed@ converts a /parsed/ Haskell code fragment to a @Case@ alternative.
-alternativeToSyntax (HsAlt _ (HsPApp (UnQual (HsIdent value)) []) (HsUnGuardedAlt alternative@(HsVar (UnQual (HsIdent name)))) []) =
-  case name of
-       "n" -> (Symbol value,             Results [ expressionToSyntax alternative ])
-       _   -> (Symbol $ fixContext name, Results [ expressionToSyntax alternative ])
+alternativeToSyntax (HsAlt _ (HsPApp (UnQual (HsIdent value)) []) (HsUnGuardedAlt alternative@(HsVar (UnQual (HsIdent name)))) []) = (Symbol $ fixContext "2" value, Call (fixName name) [])
 
-alternativeToSyntax (HsAlt _ (HsPApp (UnQual (HsIdent value)) []) (HsUnGuardedAlt action) []) = (Symbol $ fixContext value, patternToSyntax action)
+alternativeToSyntax (HsAlt _ (HsPApp (UnQual (HsIdent value)) []) (HsUnGuardedAlt action) []) = (Symbol $ fixContext "3" value, patternToSyntax action)
 
 alternativeToSyntax unmatched = error $ "Alternative: " ++ show unmatched
 
@@ -160,7 +157,7 @@ expressionToSyntax (HsVar (UnQual (HsIdent name))) = Variable name
 
 expressionToSyntax (HsLit (HsInt value)) = Value $ fromIntegral value
 
-expressionToSyntax (HsCon (UnQual (HsIdent name))) = Symbol $ fixContext name
+expressionToSyntax (HsCon (UnQual (HsIdent name))) = Symbol $ fixContext "4" name
 
 expressionToSyntax (HsInfixApp left (HsQVarOp (UnQual (HsSymbol ".+"))) right) = Plus (expressionToSyntax left) (expressionToSyntax right)
 
@@ -202,9 +199,10 @@ fixName name   = name''
         name'' = subRegex (mkRegex "_") name' "-"
 
 -- | @fixSymbol name@ fixes the context /name/.
-fixContext "BlockIn"  = "block-in"
-fixContext "BlockOut" = "block-out"
-fixContext "BlockKey" = "block-key"
-fixContext "FlowIn"   = "flow-in"
-fixContext "FlowOut"  = "flow-out"
-fixContext "FlowKey"  = "flow-key"
+fixContext _ "BlockIn"  = "block-in"
+fixContext _ "BlockOut" = "block-out"
+fixContext _ "BlockKey" = "block-key"
+fixContext _ "FlowIn"   = "flow-in"
+fixContext _ "FlowOut"  = "flow-out"
+fixContext _ "FlowKey"  = "flow-key"
+fixContext w context    = error $ "fixContext: " ++ context ++ " At: " ++ w

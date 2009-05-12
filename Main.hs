@@ -163,6 +163,8 @@ simplify node@NextChar = node
 
 simplify node@NextLine = node
 
+simplify (NonEmpty pattern) = pattern
+
 simplify (OneOrMore pattern) = And [ pattern, ZeroOrMore pattern ]
 
 simplify (Optional pattern) = Or [ pattern, Empty ]

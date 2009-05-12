@@ -104,10 +104,14 @@ counterLessThanN = -1000
 counterLessEqualN = -2000
 
 
+-- | Fake character class for testing whether state has changed compared to pushed one.
+isSameState = -3000
+
+
 -- | Special classes.
 specialClasses :: [ Int ]
 
-specialClasses = [ counterLessThanN, counterLessEqualN ]
+specialClasses = [ counterLessThanN, counterLessEqualN, isSameState ]
 
 
 -- * Create transitions.
@@ -289,14 +293,31 @@ finally :: Machine -> Machine -> Machine
 
 finally machine suffix = sequential [ prefixFailure machine suffix, suffix ]
 
-
--- | @zeroOrMoreClasses machine@ creates a @Machine@ that consumes any number of atomic (complete) repetitions of the @machine@.
+{-
+-- | @zeroOrMore machine@ creates a @Machine@ that consumes any number of atomic (complete) repetitions of the @machine@.
 -- It never fails.
 zeroOrMore :: Machine -> Machine
 
 zeroOrMore machine = insertList [ (0,                        actionState PushState 1),
                                   (1 + Map.size machine - 2, gotoState $ 1 + Map.size machine + 2),
                                   (1 + Map.size machine - 1, gotoState $ 1 + Map.size machine + 0),
+                                  (1 + Map.size machine + 0, actionState SetState $ 1 + Map.size machine + 1),
+                                  (1 + Map.size machine + 1, actionState DoneToken 1),
+                                  (1 + Map.size machine + 2, actionState ResetState $ 1 + Map.size machine + 3),
+                                  (1 + Map.size machine + 3, actionState PopState $ 1 + Map.size machine + 5),
+                                  (1 + Map.size machine + 4, failureState),
+                                  (1 + Map.size machine + 5, successState) ]
+                   $ shiftIndices 1 machine
+-}
+
+-- | @zeroOrMore machine@ creates a @Machine@ that consumes any number of atomic (complete) repetitions of the @machine@.
+-- It ensures each successful match actually changes the state (to avoid infinite loops of empty matches).
+-- It never fails.
+zeroOrMore :: Machine -> Machine
+
+zeroOrMore machine = insertList [ (0,                        actionState PushState 1),
+                                  (1 + Map.size machine - 2, gotoState $ 1 + Map.size machine + 2),
+                                  (1 + Map.size machine - 1, classesState (Set.singleton isSameState) (1 + Map.size machine + 2) (1 + Map.size machine + 0)),
                                   (1 + Map.size machine + 0, actionState SetState $ 1 + Map.size machine + 1),
                                   (1 + Map.size machine + 1, actionState DoneToken 1),
                                   (1 + Map.size machine + 2, actionState ResetState $ 1 + Map.size machine + 3),
@@ -359,7 +380,7 @@ select alternatives = let (successIndices, failureIndices, transitions, machine)
 repeatN :: Set.Set Int -> Machine
 
 repeatN classes = Map.fromList [ (0, actionState ResetCounter 1),
-                                 (1, classesState (Set.fromList [ counterLessThanN ]) 2 6),
+                                 (1, classesState (Set.singleton counterLessThanN) 2 6),
                                  (2, actionState IncrementCounter 3),
                                  (3, classesState classes 4 5),
                                  (4, actionState NextChar 1),
@@ -373,7 +394,7 @@ uptoTestN :: Set.Set Int -> Int -> Machine
 
 uptoTestN classes test = Map.fromList [ (0, actionState ResetCounter 1),
                                         (1, actionState IncrementCounter 2),
-                                        (2, classesState (Set.fromList [ test ]) 3 5),
+                                        (2, classesState (Set.singleton test) 3 5),
                                         (3, classesState classes 4 7),
                                         (4, actionState NextChar 1),
                                         (5, classesState classes 6 7),
@@ -399,7 +420,7 @@ uptoIncludingN classes = uptoTestN classes counterLessEqualN
 loopN :: Machine -> Machine-> Machine -> Machine
 
 loopN machine less equal = insertList [ (0, actionState ResetCounter 1),
-                                        (1, classesState (Set.fromList [ counterLessThanN ]) 2 (3 + Map.size machine + Map.size less)),
+                                        (1, classesState (Set.singleton counterLessThanN) 2 (3 + Map.size machine + Map.size less)),
                                         (2, actionState IncrementCounter 3),
                                         (3 + Map.size machine - 2, gotoState $ 3 + Map.size machine),
                                         (3 + Map.size machine - 1, gotoState 1),
@@ -460,6 +481,7 @@ mergeConsequtiveStates machine = Map.map merge machine
                                                                                                                       (Just (EndToken _),    _      ) -> state0
                                                                                                                       (Just (EndUnparsed _), _      ) -> state0
                                                                                                                       (Just PopState,        _      ) -> state0
+                                                                                                                      (Just SetState,        _      ) -> state0
                                                                                                                       (Just Unexpected,      _      ) -> state0
                                                                                                                       (action,               Nothing) -> state1 { sAction = action }
                                                                                                                       (_,                    _      ) -> state0
@@ -518,7 +540,7 @@ dynamic :: (Show a, Eq a) => (Int -> a -> Maybe Action -> a) -> (Int -> a -> a -
 dynamic actionFunction mergeFunction initValue machine = dynamicUpdate Map.empty [ (0, initValue) ]
   where dynamicUpdate stateData [] = stateData
         dynamicUpdate stateData ((index, entryValue) : updates) = let newEntryValue = case Map.lookup (index, Entry) stateData of
-                                                                                           Just oldEntryValue -> trace ("Data: " ++ show stateData) $ mergeFunction index entryValue oldEntryValue
+                                                                                           Just oldEntryValue -> mergeFunction index entryValue oldEntryValue
                                                                                            Nothing            -> entryValue
                                                                       Just state = Map.lookup index machine
                                                                       newExitValue = actionFunction index newEntryValue $ state|>sAction
@@ -727,10 +749,12 @@ namedDirectives :: Named -> String
 
 namedDirectives named = "BEGIN_MACHINE(" ++ (named|>nIndex) ++ ", " ++ spoilName (named|>nName) ++ ", `" ++ (named|>nName) ++ "')\n"
                      ++ listDirectives "PARAMETERS" (map parameterDirective $ named|>nParameters)
+                     {-
                      ++ (trace ("Clusters: " ++ show clusters) "")
                      ++ (trace ("Tree: " ++ show tree) "")
                      ++ (trace ("Inner: " ++ show inner) "")
                      ++ (trace ("Entry: " ++ show entry) "")
+                     -}
                      ++ "BEGIN_CLUSTERS\n"
                      ++ clusterDirectives (named|>nMachine) entry inner exit tree
                      ++ "END_CLUSTERS\n"
@@ -818,6 +842,8 @@ doneTokenIndex :: State -> String
 
 doneTokenIndex (State { sTransitions = [ Transition { tClasses = Nothing, tStateIndex = index } ] }) = show index
 
+doneTokenIndex state = error $ "doneTokenIndex: " ++ show state
+
 
 -- | @transitionDirectives (index, transition)@ converts a /transition/ with an /index/ to a list of directives.
 transitionDirectives :: (Int, Transition) -> String
@@ -845,6 +871,7 @@ fakeDirectives :: Int -> String
 fakeDirectives index
   | index == counterLessThanN  = "COUNTER_LESS_THAN_N\n"
   | index == counterLessEqualN = "COUNTER_LESS_EQUAL_N\n"
+  | index == isSameState  = "IS_SAME_STATE\n"
   | otherwise = error ("FD: " ++ show index)
 
 
